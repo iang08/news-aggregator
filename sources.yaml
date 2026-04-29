@@ -1,0 +1,107 @@
+# sources.yaml
+# RSS feeds for the morning news aggregator.
+#
+# Each source has:
+#   name:           Display name (used in your morning brief)
+#   url:            RSS or Atom feed URL
+#   category:       Groups sources in your brief: ai, tech, world, japan, science, philosophy, cars
+#   weight:         Trust multiplier (0.5 = down-weight, 2.0 = trust heavily). Default 1.0.
+#   last_reviewed:  Date you last consciously evaluated this source. Update when reviewed.
+#
+# Quarterly: run `python -m aggregator.review` to see source quality stats.
+# Edit this file freely — no code changes needed after edits.
+#
+# TODO: revisit broken feeds (logged in BROKEN_FEEDS.md):
+#   - Anthropic News, NHK World English, Nikkei Asia, Speedhunters
+
+sources:
+  # ─── AI / Local models / Agentic ──────────────────────────────────────
+  - name: "Simon Willison"
+    url: "https://simonwillison.net/atom/everything/"
+    category: ai
+    weight: 2.0
+    last_reviewed: 2026-04-28
+
+  - name: "Hacker News (200+ pts)"
+    url: "https://hnrss.org/frontpage?points=200"
+    category: ai
+    weight: 1.0
+    last_reviewed: 2026-04-28
+
+  - name: "r/LocalLLaMA"
+    url: "https://www.reddit.com/r/LocalLLaMA/.rss"
+    category: ai
+    weight: 1.2
+    last_reviewed: 2026-04-28
+
+  - name: "Hugging Face Blog"
+    url: "https://huggingface.co/blog/feed.xml"
+    category: ai
+    weight: 1.3
+    last_reviewed: 2026-04-28
+
+  # ─── General Tech ─────────────────────────────────────────────────────
+  - name: "Ars Technica"
+    url: "https://arstechnica.com/feed/"
+    category: tech
+    weight: 1.0
+    last_reviewed: 2026-04-28
+
+  # ─── World News ───────────────────────────────────────────────────────
+  - name: "BBC World"
+    url: "https://feeds.bbci.co.uk/news/world/rss.xml"
+    category: world
+    weight: 1.0
+    last_reviewed: 2026-04-28
+
+  - name: "Al Jazeera English"
+    url: "https://www.aljazeera.com/xml/rss/all.xml"
+    category: world
+    weight: 1.0
+    last_reviewed: 2026-04-28
+
+  # ─── Japan / Asia ─────────────────────────────────────────────────────
+  - name: "Japan Times"
+    url: "https://www.japantimes.co.jp/feed/"
+    category: japan
+    weight: 1.2
+    last_reviewed: 2026-04-28
+
+  # ─── Science ──────────────────────────────────────────────────────────
+  - name: "Quanta Magazine"
+    url: "https://www.quantamagazine.org/feed/"
+    category: science
+    weight: 1.5
+    last_reviewed: 2026-04-28
+
+  - name: "Nature News"
+    url: "https://www.nature.com/nature.rss"
+    category: science
+    weight: 1.0
+    last_reviewed: 2026-04-28
+
+  # ─── Philosophy / Long-form ───────────────────────────────────────────
+  - name: "Aeon Essays"
+    url: "https://aeon.co/feed.rss"
+    category: philosophy
+    weight: 1.5
+    last_reviewed: 2026-04-28
+
+  - name: "3:AM Magazine"
+    url: "https://www.3ammagazine.com/3am/feed/"
+    category: philosophy
+    weight: 1.0
+    last_reviewed: 2026-04-28
+
+  - name: "Marginal Revolution"
+    url: "https://marginalrevolution.com/feed"
+    category: philosophy
+    weight: 1.0
+    last_reviewed: 2026-04-28
+
+  # ─── Cars / JDM ───────────────────────────────────────────────────────
+  - name: "The Drive"
+    url: "https://www.thedrive.com/feed"
+    category: cars
+    weight: 0.8
+    last_reviewed: 2026-04-28
