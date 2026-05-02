@@ -82,7 +82,11 @@ def triage(articles: list[Article]) -> TriageResult:
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set. Check your .env file.")
 
-    client = Anthropic(api_key=api_key)
+    client = Anthropic(
+        api_key=api_key,
+        max_retries=3,
+        timeout=120.0,
+    )
     system_prompt = load_prompt()
     article_block = format_articles_for_claude(articles)
 
