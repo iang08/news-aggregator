@@ -4,7 +4,7 @@
 # Each source has:
 #   name:           Display name (used in your morning brief)
 #   url:            RSS or Atom feed URL
-#   category:       Groups sources in your brief: ai, tech, world, japan, science, philosophy, cars
+#   category:       Groups sources in your brief: ai, tech, world, japan, local, science, health, philosophy, cars
 #   weight:         Trust multiplier (0.5 = down-weight, 2.0 = trust heavily). Default 1.0.
 #   last_reviewed:  Date you last consciously evaluated this source. Update when reviewed.
 #
@@ -13,6 +13,13 @@
 #
 # TODO: revisit broken feeds (logged in BROKEN_FEEDS.md):
 #   - Anthropic News, NHK World English, Nikkei Asia, Speedhunters
+#
+# 2026-05-04 — Week 1 cycle 1 expansion:
+#   - Added categories: local, health
+#   - Added: Willamette Week, OPB News, Asahi Shimbun, STAT News
+#   - Bumped r/LocalLLaMA 1.2 → 1.3 (consistent click-through during Phase 0)
+#   - Asahi Shimbun is a Japanese-language feed; verify encoding works before relying on it.
+#     If it ends up in BROKEN_FEEDS.md, swap for an alternate Japanese source next Monday.
 
 sources:
   # ─── AI / Local models / Agentic ──────────────────────────────────────
@@ -31,8 +38,8 @@ sources:
   - name: "r/LocalLLaMA"
     url: "https://www.reddit.com/r/LocalLLaMA/.rss"
     category: ai
-    weight: 1.2
-    last_reviewed: 2026-04-28
+    weight: 1.3
+    last_reviewed: 2026-05-04
 
   - name: "Hugging Face Blog"
     url: "https://huggingface.co/blog/feed.xml"
@@ -67,6 +74,25 @@ sources:
     weight: 1.2
     last_reviewed: 2026-04-28
 
+  - name: "Asahi Shimbun"
+    url: "https://www.asahi.com/rss/asahi/newsheadlines.rdf"
+    category: japan
+    weight: 0.7
+    last_reviewed: 2026-05-04
+
+  # ─── Local / PNW ──────────────────────────────────────────────────────
+  - name: "Willamette Week"
+    url: "https://www.wweek.com/feed/"
+    category: local
+    weight: 0.7
+    last_reviewed: 2026-05-04
+
+  - name: "OPB News"
+    url: "https://www.opb.org/news/feed/"
+    category: local
+    weight: 0.7
+    last_reviewed: 2026-05-04
+
   # ─── Science ──────────────────────────────────────────────────────────
   - name: "Quanta Magazine"
     url: "https://www.quantamagazine.org/feed/"
@@ -79,6 +105,13 @@ sources:
     category: science
     weight: 1.0
     last_reviewed: 2026-04-28
+
+  # ─── Health ───────────────────────────────────────────────────────────
+  - name: "STAT News"
+    url: "https://www.statnews.com/feed/"
+    category: health
+    weight: 0.7
+    last_reviewed: 2026-05-04
 
   # ─── Philosophy / Long-form ───────────────────────────────────────────
   - name: "Aeon Essays"

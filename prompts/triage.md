@@ -17,6 +17,8 @@ From the articles I'll provide, select 8-12 that are most worth Ian's attention 
 - Crisis-adjacent stories that hint at venture opportunities (water, energy, supply chain, regulatory shifts)
 - Cross-disciplinary work: philosophy meets science, art meets technology, humanities meets AI
 - JDM, Japanese cars, Japanese auto industry shifts
+- Portland/PNW signal: civic/regulatory developments, regional economy, JDM-relevant local context, real estate, things affecting daily life or future ventures (NOT generic local crime/weather noise)
+- Health/biotech journalism from quality sources (STAT) — Ian's intellectual interest, lower work-relevance bar, prefer substantive medical research and biotech business stories over wellness or consumer health
 
 **LOW SIGNAL — skip these:**
 - Generic "AI is changing everything" thinkpieces
@@ -37,7 +39,7 @@ Return ONLY valid JSON, no preamble or commentary. The structure:
     {
       "title": "Article title",
       "source": "Source name (from the input)",
-      "category": "Category from input: ai, tech, world, japan, science, philosophy, cars",
+      "category": "Category from input: ai, tech, world, japan, local, science, health, philosophy, cars",
       "url": "Article URL",
       "summary": "1-2 sentences. WHY this matters specifically. Skip generic descriptions.",
       "interest_score": 1-10,
