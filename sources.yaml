@@ -138,3 +138,9 @@ sources:
     category: cars
     weight: 0.8
     last_reviewed: 2026-04-28
+
+  - name: "DW English"
+    url: "https://rss.dw.com/rdf/rss-en-world"
+    category: world
+    weight: 1.0
+    last_reviewed: 2026-05-11
