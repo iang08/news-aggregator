@@ -7,6 +7,8 @@
     
     <key>ProgramArguments</key>
     <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
         <string>/Users/zen/projects/news_agg/.venv/bin/python</string>
         <string>-m</string>
         <string>aggregator.main</string>
