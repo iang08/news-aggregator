@@ -10,9 +10,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import httpx
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
@@ -27,6 +29,15 @@ MODEL = "claude-sonnet-4-5-20250929"
 
 # Maximum tokens Claude can return. ~12 picks × ~200 tokens each + headroom = 4000.
 MAX_TOKENS = 4000
+
+# When the Anthropic API is slow, the server closes long-running streams
+# mid-response with httpx.RemoteProtocolError. The SDK's max_retries does
+# NOT catch this — it only retries on HTTP status codes. We retry here
+# explicitly. API perf varies minute-to-minute, so a retry on a "bad
+# minute" has a real chance of hitting a "good minute" (5/17 ran ~30×
+# faster than 5/16 with similar inputs).
+MAX_STREAM_ATTEMPTS = 3
+STREAM_RETRY_BACKOFF_S = 30
 
 
 @dataclass
@@ -77,7 +88,7 @@ def triage(articles: list[Article]) -> TriageResult:
     if not articles:
         raise ValueError("No articles to triage — fetch returned empty list")
 
-    load_dotenv()  # reads .env into environment
+    load_dotenv(override=True)  # override: shell may export an empty ANTHROPIC_API_KEY
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set. Check your .env file.")
@@ -85,28 +96,48 @@ def triage(articles: list[Article]) -> TriageResult:
     client = Anthropic(
         api_key=api_key,
         max_retries=3,
-        timeout=120.0,
+        timeout=600.0,
     )
     system_prompt = load_prompt()
     article_block = format_articles_for_claude(articles)
 
     logger.info(f"Sending {len(articles)} articles to Claude for triage...")
 
-    message = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=system_prompt,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"Here are {len(articles)} articles from the last 24 hours. "
-                    f"Triage them per the instructions in your system prompt.\n\n"
-                    f"{article_block}"
-                ),
-            }
-        ],
-    )
+    message = None
+    for attempt in range(1, MAX_STREAM_ATTEMPTS + 1):
+        try:
+            with client.messages.stream(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=system_prompt,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Here are {len(articles)} articles from the last 24 hours. "
+                            f"Triage them per the instructions in your system prompt.\n\n"
+                            f"{article_block}"
+                        ),
+                    }
+                ],
+            ) as stream:
+                message = stream.get_final_message()
+            break  # success — exit retry loop
+        except httpx.RemoteProtocolError as e:
+            # Anthropic server closed the stream mid-response (typically
+            # after 15+ min of slow generation). Retry — perf is variable.
+            if attempt == MAX_STREAM_ATTEMPTS:
+                logger.error(
+                    f"Stream attempt {attempt}/{MAX_STREAM_ATTEMPTS} also closed by server; giving up"
+                )
+                raise
+            logger.warning(
+                f"Stream attempt {attempt}/{MAX_STREAM_ATTEMPTS} closed by server ({e}); "
+                f"retrying in {STREAM_RETRY_BACKOFF_S}s"
+            )
+            time.sleep(STREAM_RETRY_BACKOFF_S)
+
+    assert message is not None, "loop should have either set message or raised"
 
     # Claude returns a list of content blocks; we want the text from the first one
     raw = message.content[0].text
