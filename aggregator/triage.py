@@ -105,6 +105,17 @@ def triage(articles: list[Article]) -> TriageResult:
 
     message = None
     for attempt in range(1, MAX_STREAM_ATTEMPTS + 1):
+        # Per-event timing instrumentation. We see "200 OK then long silence
+        # then RemoteProtocolError" but don't know whether tokens were
+        # trickling in slowly or never arrived at all. This loop logs the
+        # first event (TTFB), all non-delta events (block start/stop,
+        # message_delta, etc.), and a final delta count + duration. From
+        # this we can distinguish queue starvation (zero/few events) from
+        # slow generation (many delta events spread over the failure window).
+        stream_start = time.monotonic()
+        first_event_at: float | None = None
+        delta_count = 0
+        event_count = 0
         try:
             with client.messages.stream(
                 model=MODEL,
@@ -121,19 +132,53 @@ def triage(articles: list[Article]) -> TriageResult:
                     }
                 ],
             ) as stream:
+                # Only log "structural" events (block boundaries, framing).
+                # Skip content_block_delta and the SDK's synthetic "text"
+                # events — those flood the log without adding signal beyond
+                # the delta count we already track.
+                STRUCTURAL = {
+                    "message_start",
+                    "content_block_start",
+                    "content_block_stop",
+                    "message_delta",
+                    "message_stop",
+                }
+                for event in stream:
+                    elapsed = time.monotonic() - stream_start
+                    event_count += 1
+                    if first_event_at is None:
+                        first_event_at = elapsed
+                        logger.info(f"stream first event at t+{elapsed:.2f}s: {event.type}")
+                    if event.type == "content_block_delta":
+                        delta_count += 1
+                    elif event.type in STRUCTURAL:
+                        logger.info(f"stream t+{elapsed:.2f}s: {event.type}")
                 message = stream.get_final_message()
+            total = time.monotonic() - stream_start
+            logger.info(
+                f"stream complete: {event_count} events ({delta_count} deltas) "
+                f"in {total:.2f}s; first event at t+{first_event_at:.2f}s"
+            )
             break  # success — exit retry loop
         except httpx.RemoteProtocolError as e:
-            # Anthropic server closed the stream mid-response (typically
-            # after 15+ min of slow generation). Retry — perf is variable.
+            # Anthropic server closed the stream mid-response. Capture the
+            # diagnostic counters so we can tell what happened during the
+            # window before the close.
+            failure_elapsed = time.monotonic() - stream_start
+            diag = (
+                f"after {failure_elapsed:.2f}s; "
+                f"{event_count} events received ({delta_count} deltas); "
+                f"first event at t+{first_event_at:.2f}s" if first_event_at is not None
+                else f"after {failure_elapsed:.2f}s; ZERO events received (no message_start)"
+            )
             if attempt == MAX_STREAM_ATTEMPTS:
                 logger.error(
-                    f"Stream attempt {attempt}/{MAX_STREAM_ATTEMPTS} also closed by server; giving up"
+                    f"Stream attempt {attempt}/{MAX_STREAM_ATTEMPTS} closed by server; giving up. {diag}"
                 )
                 raise
             logger.warning(
                 f"Stream attempt {attempt}/{MAX_STREAM_ATTEMPTS} closed by server ({e}); "
-                f"retrying in {STREAM_RETRY_BACKOFF_S}s"
+                f"retrying in {STREAM_RETRY_BACKOFF_S}s. {diag}"
             )
             time.sleep(STREAM_RETRY_BACKOFF_S)
 
