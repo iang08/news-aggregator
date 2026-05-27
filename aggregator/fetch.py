@@ -8,6 +8,7 @@ filters by recency, returns a flat list of articles.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,15 @@ import feedparser
 import yaml
 
 logger = logging.getLogger(__name__)
+
+# launchd fires the job at scheduled time, but if the laptop was asleep
+# the job is queued and fires on wake. Right after wake, networking may
+# not be fully up — DNS, captive-portal redirects, etc. all 19 feeds
+# return malformed/empty in that window. Retry the whole fetch on the
+# "ALL sources returned zero" signal (which is much stronger than the
+# usual "a few feeds are flaky" mode and so safe to gate the retry on).
+MAX_FETCH_ATTEMPTS = 3
+FETCH_RETRY_BACKOFF_S = 60
 
 
 @dataclass
@@ -97,16 +107,42 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> list[Article]:
 
 
 def fetch_all(hours_back: int = 24) -> list[Article]:
-    """Fetch all sources and return combined article list from last N hours."""
+    """Fetch all sources and return combined article list from last N hours.
+
+    Retries the entire fetch if ALL sources returned zero articles, which is
+    the signature of network-not-ready (e.g., laptop just woke from sleep
+    when launchd fired the job). See MAX_FETCH_ATTEMPTS / FETCH_RETRY_BACKOFF_S.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
     sources = load_sources()
-    
-    all_articles: list[Article] = []
-    for source in sources:
-        all_articles.extend(fetch_source(source, cutoff))
-    
-    logger.info(f"\nTotal: {len(all_articles)} articles from {len(sources)} sources")
-    return all_articles
+
+    for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+        all_articles: list[Article] = []
+        for source in sources:
+            all_articles.extend(fetch_source(source, cutoff))
+
+        logger.info(f"\nTotal: {len(all_articles)} articles from {len(sources)} sources")
+
+        if all_articles:
+            return all_articles
+
+        if attempt == MAX_FETCH_ATTEMPTS:
+            logger.error(
+                f"All {len(sources)} sources returned 0 articles on attempt "
+                f"{attempt}/{MAX_FETCH_ATTEMPTS}; giving up. Likely network "
+                f"problem or all feeds genuinely empty."
+            )
+            return all_articles
+
+        logger.warning(
+            f"All {len(sources)} sources returned 0 articles on attempt "
+            f"{attempt}/{MAX_FETCH_ATTEMPTS}; network may not be ready yet. "
+            f"Waiting {FETCH_RETRY_BACKOFF_S}s and retrying full fetch."
+        )
+        time.sleep(FETCH_RETRY_BACKOFF_S)
+
+    # Unreachable — the loop always either returns or breaks. Kept for type checker.
+    return []
 
 
 if __name__ == "__main__":
