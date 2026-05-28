@@ -39,6 +39,20 @@ MAX_TOKENS = 4000
 MAX_STREAM_ATTEMPTS = 3
 STREAM_RETRY_BACKOFF_S = 30
 
+# Inactivity timeout for the streaming response. Per-event instrumentation
+# (5/28 logs) showed the real failure mode: the model generates partial
+# output (~30-100 events over ~15-40 sec), THEN bytes stop flowing while
+# the TCP connection stays open. We then sit in the for-loop waiting
+# 16-25 minutes before the kernel/NAT eventually times out and httpx
+# raises RemoteProtocolError. That makes the retry loop nearly useless
+# (3 attempts × 17 min = 51 min before giving up).
+#
+# Setting the client timeout to STREAM_INACTIVITY_TIMEOUT_S means httpx
+# will raise ReadTimeout if no bytes arrive for that long during the
+# stream. Normal streams have events every 0.2-0.5 sec, so 60 sec of
+# silence is unambiguously a stall. We then catch it and retry fast.
+STREAM_INACTIVITY_TIMEOUT_S = 60.0
+
 
 @dataclass
 class TriagePick:
@@ -96,7 +110,9 @@ def triage(articles: list[Article]) -> TriageResult:
     client = Anthropic(
         api_key=api_key,
         max_retries=3,
-        timeout=600.0,
+        # Used as httpx's read timeout — i.e., max gap between bytes during
+        # a streaming response. See STREAM_INACTIVITY_TIMEOUT_S comment.
+        timeout=STREAM_INACTIVITY_TIMEOUT_S,
     )
     system_prompt = load_prompt()
     article_block = format_articles_for_claude(articles)
@@ -160,10 +176,15 @@ def triage(articles: list[Article]) -> TriageResult:
                 f"in {total:.2f}s; first event at t+{first_event_at:.2f}s"
             )
             break  # success — exit retry loop
-        except httpx.RemoteProtocolError as e:
-            # Anthropic server closed the stream mid-response. Capture the
-            # diagnostic counters so we can tell what happened during the
-            # window before the close.
+        except (httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
+            # Two failure modes, both diagnosed from the 5/28 instrumented
+            # logs as mid-stream stalls:
+            #   - ReadTimeout: bytes stopped arriving for STREAM_INACTIVITY_TIMEOUT_S
+            #     (our new short-circuit; replaces the 16-25 min hang)
+            #   - RemoteProtocolError: the connection was already closed
+            #     when httpx tried to read (server closed cleanly, or
+            #     TCP/NAT eventually timed out before our inactivity timer)
+            # Same fix for both: log the diagnostic counters, retry.
             failure_elapsed = time.monotonic() - stream_start
             diag = (
                 f"after {failure_elapsed:.2f}s; "
