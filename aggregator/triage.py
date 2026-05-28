@@ -23,9 +23,11 @@ from aggregator.fetch import Article
 logger = logging.getLogger(__name__)
 
 # Claude model to use. Sonnet is the right default for this kind of
-# reading + structured output task. We'll revisit if costs add up or
-# if quality on slow news days disappoints.
-MODEL = "claude-sonnet-4-5-20250929"
+# reading + structured output task. Migrated 2026-05-28 from
+# claude-sonnet-4-5-20250929 to claude-sonnet-4-6 (current Sonnet) — a
+# newer model routes to different inference infrastructure, which may
+# resolve the mid-stream stalls we've been seeing on the 7am cron.
+MODEL = "claude-sonnet-4-6"
 
 # Maximum tokens Claude can return. ~12 picks × ~200 tokens each + headroom = 4000.
 MAX_TOKENS = 4000
@@ -136,6 +138,14 @@ def triage(articles: list[Article]) -> TriageResult:
             with client.messages.stream(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
+                # Sonnet 4.6 defaults to effort="high" (4.5 had no effort
+                # param). For a classification/extraction task this is
+                # wasteful, and high effort means longer generation — the
+                # exact condition that triggers the mid-stream stalls. Pin
+                # effort="low" + thinking disabled: matches the no-thinking
+                # behavior we had on 4.5 and keeps generation short/fast.
+                output_config={"effort": "low"},
+                thinking={"type": "disabled"},
                 system=system_prompt,
                 messages=[
                     {
