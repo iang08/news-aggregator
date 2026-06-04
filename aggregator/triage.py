@@ -32,6 +32,51 @@ MODEL = "claude-sonnet-4-6"
 # Maximum tokens Claude can return. ~12 picks × ~200 tokens each + headroom = 4000.
 MAX_TOKENS = 4000
 
+# Structured-output schema for the triage response. Passed as
+# output_config.format so the API CONSTRAINS the model to emit valid,
+# parseable JSON matching this shape — eliminating the class of failure
+# that killed the 2026-06-04 brief (an article title containing literal
+# quotes — `Now "Magic" Gives It Gravity` — copied verbatim into a JSON
+# string without escaping, breaking json.loads).
+#
+# JSON-schema constraints the API allows here are limited: NO min/max on
+# integers, NO minLength/maxLength on strings; every object needs
+# additionalProperties:false and every property listed in `required`.
+TRIAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "picks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "source": {"type": "string"},
+                    "category": {
+                        "type": "string",
+                        "enum": [
+                            "ai", "tech", "world", "japan", "local",
+                            "science", "health", "philosophy", "cars",
+                        ],
+                    },
+                    "url": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "interest_score": {"type": "integer"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": [
+                    "title", "source", "category", "url",
+                    "summary", "interest_score", "tags",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["summary", "picks"],
+    "additionalProperties": False,
+}
+
 # When the Anthropic API is slow, the server closes long-running streams
 # mid-response with httpx.RemoteProtocolError. The SDK's max_retries does
 # NOT catch this — it only retries on HTTP status codes. We retry here
@@ -99,6 +144,25 @@ def format_articles_for_claude(articles: list[Article]) -> str:
     return "\n".join(lines)
 
 
+def _parse_triage_json(raw: str) -> dict:
+    """Parse Claude's triage JSON.
+
+    Tolerates markdown code fences defensively — with structured output
+    (output_config.format) the response is bare JSON, but the fence-strip
+    costs nothing and guards against a future config change. Raises
+    json.JSONDecodeError on malformed input so the caller can retry.
+    """
+    json_text = raw.strip()
+    if json_text.startswith("```"):
+        # Strip ```json or ``` opening fence
+        json_text = json_text.split("\n", 1)[1] if "\n" in json_text else json_text
+        # Strip closing ``` fence
+        if json_text.endswith("```"):
+            json_text = json_text.rsplit("```", 1)[0]
+        json_text = json_text.strip()
+    return json.loads(json_text)
+
+
 def triage(articles: list[Article]) -> TriageResult:
     """Send articles to Claude and return the triaged result."""
     if not articles:
@@ -121,7 +185,8 @@ def triage(articles: list[Article]) -> TriageResult:
 
     logger.info(f"Sending {len(articles)} articles to Claude for triage...")
 
-    message = None
+    parsed: dict | None = None
+    raw = ""
     for attempt in range(1, MAX_STREAM_ATTEMPTS + 1):
         # Per-event timing instrumentation. We see "200 OK then long silence
         # then RemoteProtocolError" but don't know whether tokens were
@@ -138,13 +203,18 @@ def triage(articles: list[Article]) -> TriageResult:
             with client.messages.stream(
                 model=MODEL,
                 max_tokens=MAX_TOKENS,
-                # Sonnet 4.6 defaults to effort="high" (4.5 had no effort
-                # param). For a classification/extraction task this is
-                # wasteful, and high effort means longer generation — the
-                # exact condition that triggers the mid-stream stalls. Pin
-                # effort="low" + thinking disabled: matches the no-thinking
-                # behavior we had on 4.5 and keeps generation short/fast.
-                output_config={"effort": "low"},
+                # effort="low": Sonnet 4.6 defaults to effort="high" (4.5 had
+                #   no effort param). For a classification/extraction task that's
+                #   wasteful, and high effort means longer generation — the exact
+                #   condition that triggers mid-stream stalls. low + thinking
+                #   disabled matches the no-thinking behavior we had on 4.5.
+                # format: structured output — the API constrains the response to
+                #   valid JSON matching TRIAGE_SCHEMA, so a model-emitted title
+                #   with unescaped quotes can no longer produce unparseable JSON.
+                output_config={
+                    "effort": "low",
+                    "format": {"type": "json_schema", "schema": TRIAGE_SCHEMA},
+                },
                 thinking={"type": "disabled"},
                 system=system_prompt,
                 messages=[
@@ -185,7 +255,14 @@ def triage(articles: list[Article]) -> TriageResult:
                 f"stream complete: {event_count} events ({delta_count} deltas) "
                 f"in {total:.2f}s; first event at t+{first_event_at:.2f}s"
             )
-            break  # success — exit retry loop
+
+            # Parse INSIDE the retry loop so a malformed-JSON response retries
+            # instead of nuking the whole brief. With structured output this
+            # should never fail, but the retry is cheap insurance.
+            raw = message.content[0].text
+            logger.info(f"Claude responded with {len(raw)} characters")
+            parsed = _parse_triage_json(raw)  # raises json.JSONDecodeError
+            break  # success — valid stream AND valid JSON
         except (httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
             # Two failure modes, both diagnosed from the 5/28 instrumented
             # logs as mid-stream stalls:
@@ -212,28 +289,24 @@ def triage(articles: list[Article]) -> TriageResult:
                 f"retrying in {STREAM_RETRY_BACKOFF_S}s. {diag}"
             )
             time.sleep(STREAM_RETRY_BACKOFF_S)
+        except json.JSONDecodeError as e:
+            # Structured output (output_config.format) makes this near-impossible,
+            # but if the API ever returns unparseable JSON, retry rather than
+            # nuking the whole brief. (Salvaging partial JSON was considered and
+            # rejected: fragile, and structured output makes it unnecessary.)
+            if attempt == MAX_STREAM_ATTEMPTS:
+                logger.error(
+                    f"JSON parse failed on attempt {attempt}/{MAX_STREAM_ATTEMPTS} "
+                    f"(despite structured output); giving up. Raw response:\n{raw}"
+                )
+                raise RuntimeError(f"Claude returned non-JSON output: {e}") from e
+            logger.warning(
+                f"JSON parse failed on attempt {attempt}/{MAX_STREAM_ATTEMPTS} ({e}); "
+                f"retrying in {STREAM_RETRY_BACKOFF_S}s"
+            )
+            time.sleep(STREAM_RETRY_BACKOFF_S)
 
-    assert message is not None, "loop should have either set message or raised"
-
-    # Claude returns a list of content blocks; we want the text from the first one
-    raw = message.content[0].text
-    logger.info(f"Claude responded with {len(raw)} characters")
-
-    # Parse the JSON. Be tolerant of Claude wrapping it in markdown code fences.
-    json_text = raw.strip()
-    if json_text.startswith("```"):
-        # Strip ```json or ``` opening fence
-        json_text = json_text.split("\n", 1)[1] if "\n" in json_text else json_text
-        # Strip closing ``` fence
-        if json_text.endswith("```"):
-            json_text = json_text.rsplit("```", 1)[0]
-        json_text = json_text.strip()
-
-    try:
-        parsed = json.loads(json_text)
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON from Claude. Raw response:\n{raw}")
-        raise RuntimeError(f"Claude returned non-JSON output: {e}") from e
+    assert parsed is not None, "loop should have either set parsed or raised"
 
     picks = [
         TriagePick(
