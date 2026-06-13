@@ -100,6 +100,22 @@ STREAM_RETRY_BACKOFF_S = 30
 # silence is unambiguously a stall. We then catch it and retry fast.
 STREAM_INACTIVITY_TIMEOUT_S = 60.0
 
+# Local fallback (EVO-X2 Ollama). When Claude exhausts all its retries on a
+# bad-API morning (e.g. 2026-06-12: 3 hours of mid-stream stalls, no brief),
+# fall back to a local model so the brief STILL ships — slower (~4 min) and
+# slightly lower quality, but deterministic and immune to Anthropic-side
+# stalls. Validated 2026-06-12: qwen3.6:35b-a3b returns schema-valid JSON
+# with good picks on the real prompt. Disable with TRIAGE_LOCAL_FALLBACK=0.
+#
+# OLLAMA_HOST / TRIAGE_LOCAL_MODEL / TRIAGE_LOCAL_FALLBACK are read from the
+# environment inside triage() (after load_dotenv), so .env can override them.
+DEFAULT_OLLAMA_HOST = "http://evo-x2:11434"
+DEFAULT_LOCAL_MODEL = "qwen3.6:35b-a3b"
+LOCAL_KEEP_ALIVE = "2m"      # short — EVO-X2 is shared; don't hold RAM after the run
+LOCAL_TIMEOUT_S = 600.0      # generous: a 35B model on ~25k tokens takes ~4 min
+LOCAL_ATTEMPTS = 2
+LOCAL_RETRY_BACKOFF_S = 15
+
 
 @dataclass
 class TriagePick:
@@ -119,7 +135,8 @@ class TriageResult:
     summary: str  # One-sentence theme of the day
     picks: list[TriagePick]
     article_count_in: int  # How many articles were considered
-    raw_response: str  # Claude's raw output, for debugging
+    raw_response: str  # The model's raw output, for debugging
+    engine: str = "claude"  # which model produced this — "claude:..." or "local:..."
 
 
 def load_prompt(path: Path = Path("prompts/triage.md")) -> str:
@@ -163,38 +180,13 @@ def _parse_triage_json(raw: str) -> dict:
     return json.loads(json_text)
 
 
-def triage(articles: list[Article]) -> TriageResult:
-    """Send articles to Claude and return the triaged result."""
-    if not articles:
-        raise ValueError("No articles to triage — fetch returned empty list")
-
-    load_dotenv(override=True)  # override: shell may export an empty ANTHROPIC_API_KEY
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set. Check your .env file.")
-
-    client = Anthropic(
-        api_key=api_key,
-        max_retries=3,
-        # Used as httpx's read timeout — i.e., max gap between bytes during
-        # a streaming response. See STREAM_INACTIVITY_TIMEOUT_S comment.
-        timeout=STREAM_INACTIVITY_TIMEOUT_S,
-    )
-    system_prompt = load_prompt()
-    article_block = format_articles_for_claude(articles)
-
-    logger.info(f"Sending {len(articles)} articles to Claude for triage...")
-
-    parsed: dict | None = None
+def _triage_via_claude(client: Anthropic, system_prompt: str, user_msg: str) -> tuple[dict, str]:
+    """Primary path: stream from Claude with structured output, per-event
+    instrumentation, and the stall/JSON retry loop. Returns (parsed, raw).
+    Raises after MAX_STREAM_ATTEMPTS if the API never delivers a complete,
+    parseable response — the caller decides whether to fall back."""
     raw = ""
     for attempt in range(1, MAX_STREAM_ATTEMPTS + 1):
-        # Per-event timing instrumentation. We see "200 OK then long silence
-        # then RemoteProtocolError" but don't know whether tokens were
-        # trickling in slowly or never arrived at all. This loop logs the
-        # first event (TTFB), all non-delta events (block start/stop,
-        # message_delta, etc.), and a final delta count + duration. From
-        # this we can distinguish queue starvation (zero/few events) from
-        # slow generation (many delta events spread over the failure window).
         stream_start = time.monotonic()
         first_event_at: float | None = None
         delta_count = 0
@@ -217,16 +209,7 @@ def triage(articles: list[Article]) -> TriageResult:
                 },
                 thinking={"type": "disabled"},
                 system=system_prompt,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Here are {len(articles)} articles from the last 24 hours. "
-                            f"Triage them per the instructions in your system prompt.\n\n"
-                            f"{article_block}"
-                        ),
-                    }
-                ],
+                messages=[{"role": "user", "content": user_msg}],
             ) as stream:
                 # Only log "structural" events (block boundaries, framing).
                 # Skip content_block_delta and the SDK's synthetic "text"
@@ -261,17 +244,11 @@ def triage(articles: list[Article]) -> TriageResult:
             # should never fail, but the retry is cheap insurance.
             raw = message.content[0].text
             logger.info(f"Claude responded with {len(raw)} characters")
-            parsed = _parse_triage_json(raw)  # raises json.JSONDecodeError
-            break  # success — valid stream AND valid JSON
+            return _parse_triage_json(raw), raw  # success — valid stream AND JSON
         except (httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
-            # Two failure modes, both diagnosed from the 5/28 instrumented
-            # logs as mid-stream stalls:
-            #   - ReadTimeout: bytes stopped arriving for STREAM_INACTIVITY_TIMEOUT_S
-            #     (our new short-circuit; replaces the 16-25 min hang)
-            #   - RemoteProtocolError: the connection was already closed
-            #     when httpx tried to read (server closed cleanly, or
-            #     TCP/NAT eventually timed out before our inactivity timer)
-            # Same fix for both: log the diagnostic counters, retry.
+            # Mid-stream stall (diagnosed from 5/28 instrumented logs):
+            #   - ReadTimeout: bytes stopped for STREAM_INACTIVITY_TIMEOUT_S
+            #   - RemoteProtocolError: connection closed when httpx tried to read
             failure_elapsed = time.monotonic() - stream_start
             diag = (
                 f"after {failure_elapsed:.2f}s; "
@@ -290,10 +267,9 @@ def triage(articles: list[Article]) -> TriageResult:
             )
             time.sleep(STREAM_RETRY_BACKOFF_S)
         except json.JSONDecodeError as e:
-            # Structured output (output_config.format) makes this near-impossible,
-            # but if the API ever returns unparseable JSON, retry rather than
-            # nuking the whole brief. (Salvaging partial JSON was considered and
-            # rejected: fragile, and structured output makes it unnecessary.)
+            # Structured output makes this near-impossible, but if it happens,
+            # retry rather than nuking the brief. (Partial-JSON salvage was
+            # considered and rejected: fragile, and structured output moots it.)
             if attempt == MAX_STREAM_ATTEMPTS:
                 logger.error(
                     f"JSON parse failed on attempt {attempt}/{MAX_STREAM_ATTEMPTS} "
@@ -305,8 +281,117 @@ def triage(articles: list[Article]) -> TriageResult:
                 f"retrying in {STREAM_RETRY_BACKOFF_S}s"
             )
             time.sleep(STREAM_RETRY_BACKOFF_S)
+    raise RuntimeError("unreachable: loop returns or raises")  # for the type checker
 
-    assert parsed is not None, "loop should have either set parsed or raised"
+
+def _triage_via_local(
+    system_prompt: str, user_msg: str, ollama_host: str, local_model: str
+) -> tuple[dict, str]:
+    """Fallback path: EVO-X2 Ollama with the SAME prompt + schema. Slower
+    (~4 min) and slightly lower quality than Claude, but deterministic and
+    immune to Anthropic-side stalls. Returns (parsed, raw). Raises if the
+    local box is unreachable or returns garbage after LOCAL_ATTEMPTS.
+
+    num_ctx is sized from the real prompt — the article block is large, and
+    an undersized context window silently truncates the input. keep_alive is
+    pinned short because EVO-X2 is a shared box (don't hold 35B in RAM)."""
+    approx_tokens = (len(system_prompt) + len(user_msg)) // 3
+    num_ctx = 32768 if approx_tokens < 30000 else 49152
+    logger.info(
+        f"Local fallback: {local_model} @ {ollama_host} "
+        f"(num_ctx={num_ctx}, ~{approx_tokens} input tokens)"
+    )
+    t0 = time.monotonic()
+    last_err: Exception | None = None
+    for attempt in range(1, LOCAL_ATTEMPTS + 1):
+        try:
+            resp = httpx.post(
+                f"{ollama_host}/api/chat",
+                json={
+                    "model": local_model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    "format": TRIAGE_SCHEMA,  # Ollama structured output — same schema
+                    "stream": False,
+                    "keep_alive": LOCAL_KEEP_ALIVE,
+                    "options": {"num_ctx": num_ctx, "temperature": 0.3},
+                },
+                timeout=LOCAL_TIMEOUT_S,
+            )
+            resp.raise_for_status()
+            raw = resp.json()["message"]["content"]
+            parsed = _parse_triage_json(raw)
+            logger.info(
+                f"Local fallback complete in {time.monotonic() - t0:.1f}s, {len(raw)} chars"
+            )
+            return parsed, raw
+        except (httpx.HTTPError, json.JSONDecodeError, KeyError) as e:
+            last_err = e
+            if attempt == LOCAL_ATTEMPTS:
+                break
+            logger.warning(
+                f"Local fallback attempt {attempt}/{LOCAL_ATTEMPTS} failed ({e}); "
+                f"retrying in {LOCAL_RETRY_BACKOFF_S}s"
+            )
+            time.sleep(LOCAL_RETRY_BACKOFF_S)
+    raise RuntimeError(
+        f"Local fallback failed after {LOCAL_ATTEMPTS} attempts: {last_err}"
+    ) from last_err
+
+
+def triage(articles: list[Article]) -> TriageResult:
+    """Triage articles into a brief. Tries Claude first; on a total Claude
+    failure (stalls/timeouts exhausted), falls back to the EVO-X2 local model
+    so the brief still ships. Set TRIAGE_LOCAL_FALLBACK=0 to disable fallback."""
+    if not articles:
+        raise ValueError("No articles to triage — fetch returned empty list")
+
+    load_dotenv(override=True)  # override: shell may export an empty ANTHROPIC_API_KEY
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set. Check your .env file.")
+
+    client = Anthropic(
+        api_key=api_key,
+        max_retries=3,
+        # Used as httpx's read timeout — i.e., max gap between bytes during
+        # a streaming response. See STREAM_INACTIVITY_TIMEOUT_S comment.
+        timeout=STREAM_INACTIVITY_TIMEOUT_S,
+    )
+    system_prompt = load_prompt()
+    article_block = format_articles_for_claude(articles)
+
+    logger.info(f"Sending {len(articles)} articles to Claude for triage...")
+
+    user_msg = (
+        f"Here are {len(articles)} articles from the last 24 hours. "
+        f"Triage them per the instructions in your system prompt.\n\n"
+        f"{article_block}"
+    )
+
+    # Fallback config (read after load_dotenv so .env can override).
+    fallback_enabled = os.getenv("TRIAGE_LOCAL_FALLBACK", "1") != "0"
+    ollama_host = os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
+    local_model = os.getenv("TRIAGE_LOCAL_MODEL", DEFAULT_LOCAL_MODEL)
+
+    # Claude is primary. On a TOTAL Claude failure (stalls/timeouts/parse all
+    # exhausted), fall back to the local model so the brief still ships rather
+    # than producing nothing — which is what happened 2026-06-12.
+    engine = f"claude:{MODEL}"
+    try:
+        parsed, raw = _triage_via_claude(client, system_prompt, user_msg)
+    except Exception as claude_err:
+        if not fallback_enabled:
+            raise
+        logger.error(
+            f"Claude triage failed ({type(claude_err).__name__}: {claude_err}). "
+            f"Falling back to the local model on EVO-X2 so the brief still ships."
+        )
+        parsed, raw = _triage_via_local(system_prompt, user_msg, ollama_host, local_model)
+        engine = f"local:{local_model}"
+        logger.info(f"Brief generated via FALLBACK engine: {engine}")
 
     picks = [
         TriagePick(
@@ -326,6 +411,7 @@ def triage(articles: list[Article]) -> TriageResult:
         picks=picks,
         article_count_in=len(articles),
         raw_response=raw,
+        engine=engine,
     )
 
 
