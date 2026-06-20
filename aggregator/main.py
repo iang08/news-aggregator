@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 from aggregator.fetch import fetch_all
@@ -56,5 +57,20 @@ def run() -> int:
         return 1
 
 
+def _write_heartbeat(rc: int) -> None:
+    """Record an ops-dashboard heartbeat so the health dashboard can confirm this run.
+    Best-effort — monitoring must never break the brief."""
+    import time
+    try:
+        d = os.path.expanduser("~/.ops-heartbeats")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "newsbrief"), "w") as f:
+            f.write("%d %s\n" % (int(time.time()), "ok" if rc == 0 else "fail"))
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    rc = run()
+    _write_heartbeat(rc)
+    sys.exit(rc)
