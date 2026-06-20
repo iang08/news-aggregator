@@ -10,8 +10,10 @@ cd "$HOME/projects/news_agg" || exit 1
 PYTHONPATH=. .venv/bin/python -m aggregator.main
 rc=$?
 
-# ops-dashboard heartbeat (ok|fail by exit code) — same convention as us_sourcing
-"$HOME/.ops-heartbeats/beat.sh" news_brief "$rc" 2>/dev/null || true
+# NOTE: the ops-dashboard heartbeat is written by main.py itself
+# (_write_heartbeat -> ~/.ops-heartbeats/newsbrief), so we don't beat here.
+# Since main.py now runs on EVO-X2, that heartbeat lives on EVO-X2 — point the
+# dashboard at EVO-X2's ~/.ops-heartbeats/newsbrief (same as us_sourcing).
 
 # Deliver whatever is pending (this run's brief, plus any earlier undelivered)
 "$HOME/projects/news_agg/scripts/deliver.sh"
