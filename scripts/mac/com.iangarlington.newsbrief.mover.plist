@@ -6,7 +6,8 @@
     <string>com.iangarlington.newsbrief.mover</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/zen/bin/news_agg_move_brief.sh</string>
+        <string>/Users/zen/projects/news_agg/.venv/bin/python</string>
+        <string>/Users/zen/bin/news_agg_move_brief.py</string>
     </array>
     <key>StartInterval</key>
     <integer>120</integer>
