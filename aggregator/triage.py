@@ -7,9 +7,11 @@ calls the Claude API, parses the JSON response, returns a TriageResult.
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -115,6 +117,57 @@ LOCAL_KEEP_ALIVE = "2m"      # short — EVO-X2 is shared; don't hold RAM after 
 LOCAL_TIMEOUT_S = 600.0      # generous: a 35B model on ~25k tokens takes ~4 min
 LOCAL_ATTEMPTS = 2
 LOCAL_RETRY_BACKOFF_S = 15
+
+# Cross-day dedup. The brief is otherwise stateless — each run re-triages the
+# last 24h with no memory of what it featured before, so major multi-day
+# stories (and any window overlap) resurface. We give triage memory by reading
+# the recent brief files it already keeps: hard-exclude any article URL already
+# featured (deterministic), and tell the model which topics were just covered
+# so it avoids repeating them unless there's genuinely new development.
+#
+# History source: BRIEF_HISTORY_DIRS (os.pathsep-separated) if set, else the
+# brief output dir. On EVO-X2 set it to include the delivered/ dir, since
+# deliver.sh moves shipped briefs out of the output dir.
+BRIEF_HISTORY_DAYS = 5
+_PICK_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+_BRIEF_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})-brief\.md$")
+
+
+def _history_dirs() -> list[str]:
+    """Directories to scan for past briefs (read AFTER load_dotenv)."""
+    raw = os.getenv("BRIEF_HISTORY_DIRS", "")
+    if raw:
+        return [d for d in raw.split(os.pathsep) if d]
+    vault = os.getenv("OBSIDIAN_VAULT_PATH")
+    folder = os.getenv("OBSIDIAN_BRIEF_FOLDER", "00-Inbox")
+    return [os.path.join(vault, folder)] if vault else []
+
+
+def _recent_brief_history(dirs: list[str], days: int) -> tuple[set[str], list[str]]:
+    """Return (seen_urls, recent_picks) from the most recent `days` distinct
+    brief files across `dirs`. Best-effort — any error returns ([], []) so dedup
+    can never break the brief."""
+    try:
+        by_date: dict[str, str] = {}
+        for d in dirs:
+            for path in glob.glob(os.path.join(d, "*-brief.md")):
+                m = _BRIEF_DATE_RE.search(os.path.basename(path))
+                if m:
+                    by_date.setdefault(m.group(1), path)  # one file per date
+        seen_urls: set[str] = set()
+        recent_picks: list[str] = []
+        for date in sorted(by_date, reverse=True)[:days]:
+            try:
+                text = Path(by_date[date]).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for title, url in _PICK_LINK_RE.findall(text):
+                seen_urls.add(url)
+                recent_picks.append(f"{date}: {title}")
+        return seen_urls, recent_picks
+    except Exception as e:  # never let dedup break the run
+        logger.warning(f"Cross-day dedup: could not read brief history ({e}); proceeding without it")
+        return set(), []
 
 
 @dataclass
@@ -361,13 +414,39 @@ def triage(articles: list[Article]) -> TriageResult:
         timeout=STREAM_INACTIVITY_TIMEOUT_S,
     )
     system_prompt = load_prompt()
+
+    # Cross-day dedup: drop articles already featured in recent briefs
+    # (deterministic), and tell the model which topics were just covered.
+    seen_urls, recent_picks = _recent_brief_history(_history_dirs(), BRIEF_HISTORY_DAYS)
+    if seen_urls:
+        before = len(articles)
+        articles = [a for a in articles if a.link not in seen_urls]
+        dropped = before - len(articles)
+        if dropped:
+            logger.info(
+                f"Cross-day dedup: dropped {dropped} article(s) already featured "
+                f"in the last {BRIEF_HISTORY_DAYS} briefs"
+            )
+    if not articles:
+        raise ValueError("All fetched articles were already featured recently — nothing new to triage")
+
     article_block = format_articles_for_claude(articles)
+    recent_block = ""
+    if recent_picks:
+        recent_block = (
+            "\n\n## Already covered in the last few days' briefs\n"
+            "Do NOT re-select these stories unless there is a genuinely new, material "
+            "development today — and if you do, make the summary specifically about "
+            "what's NEW. Otherwise prefer fresh stories.\n"
+            + "\n".join(f"- {p}" for p in recent_picks)
+        )
 
     logger.info(f"Sending {len(articles)} articles to Claude for triage...")
 
     user_msg = (
         f"Here are {len(articles)} articles from the last 24 hours. "
-        f"Triage them per the instructions in your system prompt.\n\n"
+        f"Triage them per the instructions in your system prompt."
+        f"{recent_block}\n\n"
         f"{article_block}"
     )
 
