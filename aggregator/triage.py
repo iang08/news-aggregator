@@ -459,10 +459,11 @@ def _triage_via_claude(
                 f"retrying in {STREAM_RETRY_BACKOFF_S}s"
             )
             time.sleep(STREAM_RETRY_BACKOFF_S)
-        except (httpx.RemoteProtocolError, httpx.ReadTimeout, anthropic.APIConnectionError) as e:
+        except (httpx.TransportError, anthropic.APIConnectionError) as e:
             # Mid-stream stall (diagnosed from 5/28 instrumented logs):
             #   - ReadTimeout: bytes stopped for STREAM_INACTIVITY_TIMEOUT_S
             #   - RemoteProtocolError: connection closed when httpx tried to read
+            #   - ReadError etc.: the connection was reset mid-stream
             # APIConnectionError/APITimeoutError: the SDK's own connection
             # retries ran out before the stream started.
             failure_elapsed = time.monotonic() - stream_start
@@ -716,7 +717,14 @@ def triage(articles: list[Article]) -> TriageResult:
             f"Claude triage failed ({fallback_reason}). "
             f"Falling back to the local model so the brief still ships."
         )
-        parsed, raw = _triage_via_local(system_prompt, user_msg, ollama_host, local_model, meta)
+        try:
+            parsed, raw = _triage_via_local(system_prompt, user_msg, ollama_host, local_model, meta)
+        except Exception as local_err:
+            # Keep BOTH causes: the failure note should say why Claude failed too.
+            raise RuntimeError(
+                f"Claude failed ({fallback_reason[:200]}); local fallback failed "
+                f"({type(local_err).__name__}: {str(local_err)[:200]})"
+            ) from local_err
         engine = f"local:{local_model}"
         logger.info(f"Brief generated via FALLBACK engine: {engine}")
 

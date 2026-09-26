@@ -27,7 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 from aggregator.fetch import FetchResult, SourceStatus, fetch_all_with_status
-from aggregator.triage import TriageResult, load_env, triage
+from aggregator.triage import TriageResult, load_env, triage, triage_model
 from aggregator.output import existing_brief, write_brief, write_failure_note
 
 # A feed that failed this many runs in a row is "dead" and flagged in the
@@ -162,18 +162,20 @@ def run() -> tuple[int, str, str]:
 
     logger.info("=== News aggregator run starting ===")
 
-    # Check before spending a fetch + an API call: a second run on the same day
-    # must not replace a delivered brief (it may carry Ian's ticks).
-    existing = existing_brief(started.strftime("%Y-%m-%d"))
-    if existing and os.getenv("BRIEF_OVERWRITE") != "1":
-        logger.error(f"Today's brief already exists ({existing}); not running. Set BRIEF_OVERWRITE=1 to replace it.")
-        return 3, "skipped", ""
-
     fetch: FetchResult | None = None
     result: TriageResult | None = None
     brief_path: Path | None = None
     status, error, notices = "fail", "", []
     try:
+        # Checks that need no network come first: a second run on the same day
+        # must not replace a delivered brief (it may carry Ian's ticks), and a
+        # bad TRIAGE_MODEL should fail in a second, not after the whole fetch.
+        existing = existing_brief(started.strftime("%Y-%m-%d"))
+        if existing and os.getenv("BRIEF_OVERWRITE") != "1":
+            logger.error(f"Today's brief already exists ({existing}); not running. Set BRIEF_OVERWRITE=1 to replace it.")
+            return 3, "skipped", ""
+        triage_model()
+
         # Step 1: Fetch articles from RSS feeds
         fetch = fetch_all_with_status()
         if not fetch.articles:
@@ -214,8 +216,12 @@ def run() -> tuple[int, str, str]:
 
 def _write_heartbeat(status: str, detail: str = "") -> None:
     """Record an ops-dashboard heartbeat: "<epoch> ok|degraded|fail <detail>".
-    The dashboard reads the first two fields. Best-effort — monitoring must
-    never break the brief."""
+    The dashboard reads the first two fields. Only production runs beat
+    (run_and_deliver.sh sets NEWS_AGG_HEARTBEAT=1), so a dry run by hand can't
+    overwrite the real status. Best-effort — monitoring must never break the
+    brief."""
+    if os.getenv("NEWS_AGG_HEARTBEAT") != "1":
+        return
     try:
         d = os.path.expanduser("~/.ops-heartbeats")
         os.makedirs(d, exist_ok=True)
@@ -226,7 +232,12 @@ def _write_heartbeat(status: str, detail: str = "") -> None:
 
 
 if __name__ == "__main__":
-    rc, status, detail = run()
+    try:
+        rc, status, detail = run()
+    except Exception as e:  # backstop: a crash outside run()'s own handling
+        logging.getLogger(__name__).exception("run crashed")
+        rc, status, detail = 1, "fail", f"crash={type(e).__name__}"
+        write_failure_note(f"the run crashed: {type(e).__name__}: {e}"[:300])
     if status != "skipped":  # a refused re-run says nothing about today's brief
         _write_heartbeat(status, detail)
     sys.exit(rc)

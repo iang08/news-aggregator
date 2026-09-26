@@ -100,6 +100,15 @@ def clean_text(s: str | None) -> str:
     return _WS_RE.sub(" ", html.unescape(s)).strip()
 
 
+def _entry_text(value: str | None, detail: dict | None) -> str:
+    """Clean a feed field by its declared type. feedparser has already
+    unescaped text/plain fields, and they may legitimately contain '<...>'
+    ("The <dialog> element"), so those only get whitespace collapsed."""
+    if (detail or {}).get("type") == "text/plain":
+        return _WS_RE.sub(" ", value or "").strip()
+    return clean_text(value)
+
+
 def load_sources(path: Path = Path("sources.yaml")) -> list[dict[str, Any]]:
     """Load and validate source configs from sources.yaml."""
     if not path.exists():
@@ -190,13 +199,13 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article
         if published < cutoff:
             continue  # Too old
 
-        summary = entry.get("summary") or ""
+        summary, summary_detail = entry.get("summary") or "", entry.get("summary_detail")
         if not summary and entry.get("content"):
-            summary = entry["content"][0].get("value", "")
+            summary, summary_detail = entry["content"][0].get("value", ""), entry["content"][0]
         articles.append(Article(
-            title=clean_text(entry.get("title")) or "(no title)",
+            title=_entry_text(entry.get("title"), entry.get("title_detail")) or "(no title)",
             link=entry.get("link", ""),
-            summary=clean_text(summary)[:SUMMARY_MAX_CHARS],
+            summary=_entry_text(summary, summary_detail)[:SUMMARY_MAX_CHARS],
             published=published,
             source_name=name,
             source_category=source["category"],
@@ -238,7 +247,15 @@ def fetch_all_with_status(hours_back: int = 24) -> FetchResult:
         all_articles: list[Article] = []
         statuses: list[SourceStatus] = []
         for source in sources:
-            articles, status = fetch_source(source, cutoff)
+            try:
+                articles, status = fetch_source(source, cutoff)
+            except Exception as e:  # noqa: BLE001 — one bad entry (a typo'd URL, an odd feed) must never stop the run
+                logger.warning(f"  ✗ {source.get('name')}: {type(e).__name__}: {e}")
+                articles = []
+                status = SourceStatus(
+                    name=str(source.get("name")), category=str(source.get("category")), ok=False,
+                    error=f"{type(e).__name__}: {e}"[:160],
+                )
             all_articles.extend(articles)
             statuses.append(status)
 

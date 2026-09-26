@@ -11,11 +11,13 @@ denied — see git history. Runs on a launchd interval; sleep-tolerant.
 Each pass:
   1. moves *-brief.md and *-brief-FAILED.md into the vault; a failure note or a
      brief marked `status: degraded` pops a macOS notification
-  2. if it's past STALE_AFTER (Pacific) and today's brief hasn't arrived, pops a
+  2. if it's past STALE_AFTER (Pacific), the Mac has been awake long enough for
+     a delivery to have happened, and today's brief hasn't arrived, pops a
      "missing" notification once — the case where EVO-X2 itself is down and
      can't report anything (2026-09-25: down 03:26-12:25, silence all day)
-  3. harvests the checkboxes Ian ticked in recent briefs into
-     ~/news_agg_feedback/ticks.json, which EVO-X2's deliver.sh pulls
+  3. writes the checkboxes Ian ticked in recent briefs to
+     ~/news_agg_feedback/<date>.json, which EVO-X2's deliver.sh pulls
+A file that can't be moved into the vault pops a "stuck" notification.
 """
 import glob
 import json
@@ -32,11 +34,15 @@ INBOX = os.path.expanduser("~/news_agg_inbox")
 VAULT = os.path.expanduser("~/Documents/obsidian/myvault/00-Inbox")
 LOG = os.path.expanduser("~/Library/Logs/news_agg_mover.log")
 STATE = os.path.expanduser("~/Library/Application Support/news_agg")
-FEEDBACK = os.path.expanduser("~/news_agg_feedback/ticks.json")
+FEEDBACK_DIR = os.path.expanduser("~/news_agg_feedback")
 
 # Briefs are dated and generated in Pacific time on EVO-X2, wherever the laptop is.
 PT = ZoneInfo("America/Los_Angeles")
 STALE_AFTER = dtime(9, 30)  # 07:00 run + catch-up slack
+# After a wake, EVO-X2's */15 deliver.sh needs time to reach the Mac (Tailscale
+# reconnect + up to two ticks) — without this, waking after 09:30 alarmed ~1 day in 4.
+AWAKE_BEFORE_ALARM = timedelta(minutes=35)
+SLEEP_GAP = timedelta(minutes=10)  # launchd runs us every 120 s; a longer gap = asleep
 FEEDBACK_DAYS = 30
 
 _PICK_RE = re.compile(r"^- \[([ xX])\] \*\*\[(.+?)\]\((https?://[^)\s]+)\)\*\*")
@@ -48,15 +54,52 @@ def logline(msg: str) -> None:
         f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
 
 
-def notify(title: str, message: str) -> None:
-    """macOS notification. json.dumps yields a valid AppleScript string literal."""
-    script = f"display notification {json.dumps(message[:220])} with title {json.dumps(title)}"
+def notify(title: str, message: str) -> bool:
+    """macOS notification. The text goes in as argv, never into the script
+    source: quoting it into AppleScript broke on the em dash in half the
+    messages, and the failure was silent. Returns True if osascript succeeded."""
+    cmd = ["/usr/bin/osascript",
+           "-e", "on run argv",
+           "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
+           "-e", "end run",
+           message[:220], title]
     try:
-        subprocess.run(["/usr/bin/osascript", "-e", script], timeout=15, check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        logline(f"notified: {title}: {message[:120]}")
+        r = subprocess.run(cmd, timeout=15, capture_output=True, text=True)
     except Exception as e:  # noqa: BLE001 — a notification must never break the move
-        logline(f"notification failed ({e}): {title}: {message[:120]}")
+        logline(f"notification FAILED ({e}): {title}: {message[:120]}")
+        return False
+    if r.returncode != 0:
+        logline(f"notification FAILED (rc={r.returncode} {r.stderr.strip()[:200]}): {title}: {message[:120]}")
+        return False
+    logline(f"notified: {title}: {message[:120]}")
+    return True
+
+
+def notify_once(key: str, title: str, message: str) -> None:
+    """Notify at most once per key; the marker is written only after success."""
+    os.makedirs(STATE, exist_ok=True)
+    marker = os.path.join(STATE, f"alerted-{key}")
+    if not os.path.exists(marker) and notify(title, message):
+        open(marker, "w").close()
+
+
+def awake_since(now: datetime) -> datetime:
+    """When the Mac last woke (or the mover first ran), tracked across passes."""
+    os.makedirs(STATE, exist_ok=True)
+    last_pass_f = os.path.join(STATE, "last-pass")
+    awake_f = os.path.join(STATE, "awake-since")
+    try:
+        last = datetime.fromtimestamp(float(open(last_pass_f).read()), now.tzinfo)
+        since = datetime.fromtimestamp(float(open(awake_f).read()), now.tzinfo)
+    except (OSError, ValueError):
+        last = since = None
+    if last is None or since is None or now - last > SLEEP_GAP:
+        since = now
+        with open(awake_f, "w") as f:
+            f.write(str(now.timestamp()))
+    with open(last_pass_f, "w") as f:
+        f.write(str(now.timestamp()))
+    return since
 
 
 def _plain(s: str) -> str:
@@ -98,34 +141,39 @@ def move_new_files() -> None:
                     time.sleep(2)
             if last_err is not None:
                 logline(f"FAILED to move {name}: {last_err}")
+                extra = alert_for(src)
+                notify_once(f"stuck-{name}", "News brief stuck",
+                            f"{name} arrived but can't be moved into the vault: {last_err}"
+                            + (f" ({extra[0]}: {extra[1]})" if extra else ""))
                 continue
             alert = alert_for(dest)
             if alert:
                 notify(*alert)
 
 
-def check_missing(now_pt: datetime) -> None:
-    """Notify once a day if today's brief (or a failure note) hasn't arrived."""
-    if now_pt.time() < STALE_AFTER:
+def check_missing(now_pt: datetime, since: datetime) -> None:
+    """Notify once a day if today's brief (or a failure note) hasn't arrived.
+    A file stuck in the inbox counts as arrived — move_new_files alerts on that."""
+    if now_pt.time() < STALE_AFTER or now_pt - since < AWAKE_BEFORE_ALARM:
         return
     today = now_pt.strftime("%Y-%m-%d")
     names = (f"{today}-brief.md", f"{today}-brief-FAILED.md")
     if any(os.path.exists(os.path.join(d, n)) for d in (VAULT, INBOX) for n in names):
         return
-    os.makedirs(STATE, exist_ok=True)
-    marker = os.path.join(STATE, f"missing-alerted-{today}")
-    if os.path.exists(marker):
-        return
-    open(marker, "w").close()
-    for old in glob.glob(os.path.join(STATE, "missing-alerted-*")):
-        if old != marker:
-            os.remove(old)
-    notify("News brief missing", f"No brief for {today} yet — EVO-X2 may be down, or the 07:00 run is late.")
+    notify_once(f"missing-{today}", "News brief missing",
+                f"No brief for {today} yet — EVO-X2 may be down, or the 07:00 run is late.")
 
 
 def harvest_feedback(now_pt: datetime) -> None:
-    """Snapshot every pick checkbox in the last FEEDBACK_DAYS of briefs."""
+    """Write every pick checkbox of the last FEEDBACK_DAYS of briefs to
+    FEEDBACK_DIR/<date>.json (only when it changed). One file per date, so an
+    unreadable vault or an aged-out brief never erases what was harvested."""
     cutoff = (now_pt - timedelta(days=FEEDBACK_DAYS)).strftime("%Y-%m-%d")
+    try:
+        os.listdir(VAULT)
+    except OSError as e:
+        logline(f"feedback: vault unlistable ({e}); keeping previous files")
+        return
     briefs: dict[str, list[dict]] = {}
     for path in sorted(glob.glob(os.path.join(VAULT, "*-brief.md"))):
         m = _BRIEF_RE.match(os.path.basename(path))
@@ -143,25 +191,30 @@ def harvest_feedback(now_pt: datetime) -> None:
             continue
         if picks:  # briefs from before checkboxes existed have none
             briefs[m.group(1)] = picks
-    snapshot = json.dumps({"briefs": briefs}, ensure_ascii=False, indent=1, sort_keys=True)
-    try:
-        with open(FEEDBACK, encoding="utf-8") as f:
-            if f.read() == snapshot:
-                return
-    except OSError:
-        pass
-    os.makedirs(os.path.dirname(FEEDBACK), exist_ok=True)
-    tmp = FEEDBACK + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(snapshot)
-    os.replace(tmp, FEEDBACK)
-    ticked = sum(p["checked"] for ps in briefs.values() for p in ps)
-    logline(f"feedback: {ticked} ticked picks across {len(briefs)} briefs")
+    os.makedirs(FEEDBACK_DIR, exist_ok=True)
+    for date, picks in briefs.items():
+        path = os.path.join(FEEDBACK_DIR, f"{date}.json")
+        snapshot = json.dumps({"date": date, "picks": picks}, ensure_ascii=False, indent=1)
+        try:
+            with open(path, encoding="utf-8") as f:
+                if f.read() == snapshot:
+                    continue
+        except OSError:
+            pass
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            f.write(snapshot)
+        os.replace(path + ".tmp", path)
+        logline(f"feedback: {date}: {sum(p['checked'] for p in picks)}/{len(picks)} picks ticked")
 
 
 def main() -> int:
     now_pt = datetime.now(PT)
-    for step in (move_new_files, lambda: check_missing(now_pt), lambda: harvest_feedback(now_pt)):
+    since = now_pt
+    try:
+        since = awake_since(now_pt)
+    except Exception as e:  # noqa: BLE001
+        logline(f"awake tracking failed: {e}")
+    for step in (move_new_files, lambda: check_missing(now_pt, since), lambda: harvest_feedback(now_pt)):
         try:
             step()
         except Exception as e:  # noqa: BLE001 — each step is independent

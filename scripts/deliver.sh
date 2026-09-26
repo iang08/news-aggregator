@@ -14,8 +14,9 @@
 # delivery until the Mac is reachable. Failure notes (*-brief-FAILED.md) travel
 # the same way.
 #
-# After delivering a brief it also pulls ~/news_agg_feedback/ticks.json (the
-# picks Ian ticked, harvested by the Mac mover) into ~/news_agg_out/feedback/.
+# After delivering a brief it also pulls ~/news_agg_feedback/ (one JSON per
+# brief date with the picks Ian ticked, written by the Mac mover) into
+# ~/news_agg_out/feedback/.
 set -uo pipefail
 
 OUT="$HOME/news_agg_out/00-Inbox"
@@ -38,22 +39,29 @@ cd "$OUT" 2>/dev/null || exit 0
 
 shopt -s nullglob
 delivered_brief=0
+# rsync's last stderr line is its generic "rsync error: ... (code 255)"; the
+# cause (ssh: connect ... timed out, Permission denied, ...) comes before it.
+cause() { local m; m=$(printf '%s\n' "$1" | grep -v '^rsync error:' | grep -v '^$' | head -1)
+    [ -n "$m" ] || m=$(printf '%s\n' "$1" | tail -1); printf '%s' "${m:0:160}"; }
+
 for f in *-brief.md *-brief-FAILED.md; do
     if err=$(rsync -az --timeout=60 -e "$SSH" "$f" "$MAC_DEST" 2>&1); then
         mv -f "$f" "$DONE/"
         echo "$(date '+%F %T') delivered $f"
         case "$f" in *-brief.md) delivered_brief=1 ;; esac
     else
-        echo "$(date '+%F %T') deliver FAILED for $f ($(echo "$err" | tail -1 | cut -c1-160)); will retry"
+        echo "$(date '+%F %T') deliver FAILED for $f ($(cause "$err")); will retry"
     fi
 done
 
 # Once per delivered brief (not every 15 min — the laptop is often asleep).
+# One file per brief date; no --delete, so EVO-X2's copy keeps accumulating
+# after the Mac stops rewriting old dates.
 if [ "$delivered_brief" = 1 ]; then
     mkdir -p "$FEEDBACK"
-    if err=$(rsync -az --timeout=60 -e "$SSH" "$MAC:news_agg_feedback/ticks.json" "$FEEDBACK/" 2>&1); then
-        echo "$(date '+%F %T') pulled feedback ticks.json"
+    if err=$(rsync -az --timeout=60 -e "$SSH" "$MAC:news_agg_feedback/" "$FEEDBACK/" 2>&1); then
+        echo "$(date '+%F %T') pulled feedback ($(ls "$FEEDBACK" | wc -l) dates)"
     else
-        echo "$(date '+%F %T') feedback pull failed ($(echo "$err" | tail -1 | cut -c1-160))"
+        echo "$(date '+%F %T') feedback pull failed ($(cause "$err"))"
     fi
 fi

@@ -107,6 +107,29 @@ class FetchTests(unittest.TestCase):
         self.assertFalse(st.ok)
         self.assertIn("not a parseable feed", st.error)
 
+    def test_bad_url_does_not_stop_the_run(self):
+        bad = {"name": "Bad", "url": "https://ｗｗｗ.example.jp/rss", "category": "japan", "weight": 1.0, "max_items": 0}
+        good = {**self.src, "name": "Good"}
+        real = fetch._download
+        def download(url):
+            if url == good["url"]:
+                return 200, {}, url, rss([("ok", "https://a/1", self.now, "s")])
+            return real(url)  # the real call raises httpx.InvalidURL before any network I/O
+        with mock.patch.object(fetch, "load_sources", return_value=[bad, good]), \
+                mock.patch.object(fetch, "_download", download):
+            r = fetch.fetch_all_with_status(24)
+        self.assertEqual([a.title for a in r.articles], ["ok"])
+        self.assertEqual([s.name for s in r.failed], ["Bad"])
+        self.assertIn("InvalidURL", r.failed[0].error)
+
+    def test_plain_text_title_keeps_angle_brackets(self):
+        atom = (b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>F</title>'
+                b'<entry><title type="text">The &lt;dialog&gt; element</title><link href="https://a/1"/>'
+                b'<updated>' + self.now.strftime("%Y-%m-%dT%H:%M:%SZ").encode() + b'</updated>'
+                b'<summary type="html">&lt;p&gt;Body&lt;/p&gt;</summary></entry></feed>')
+        arts, _ = self.fetch_with(atom)
+        self.assertEqual((arts[0].title, arts[0].summary), ("The <dialog> element", "Body"))
+
     def test_empty_but_valid_feed_is_ok(self):
         arts, st = self.fetch_with(rss([]))
         self.assertEqual((arts, st.ok), ([], True))
@@ -270,6 +293,11 @@ class ClaudePathTests(unittest.TestCase):
         (parsed, _), client, _ = self.call([httpx.ReadTimeout("stall"), message()])
         self.assertEqual(len(client.calls), 2)
 
+    def test_connection_reset_is_retried(self):
+        (parsed, _), client, meta = self.call([httpx.ReadError("Connection reset by peer"), message()])
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(meta["attempts"][0]["error"], "ReadError")
+
     def test_truncated_response(self):
         res, client, _ = self.call([message(text='{"summ', stop="max_tokens")])
         self.assertIsInstance(res, triage.ClaudeTruncatedError)
@@ -300,6 +328,16 @@ class TriageFallbackTests(EnvTestCase):
         self.assertTrue(res.engine.startswith("local:"))
         self.assertIn("HTTP 400 bad param", res.fallback_reason)
         self.assertEqual(len(res.picks), 1)
+
+    def test_fallback_failure_keeps_both_errors(self):
+        arts = [Article("T", "https://a/1", "s", datetime.now(timezone.utc), "Src", "ai", 1.0)]
+        with mock.patch.object(triage, "_triage_via_claude", side_effect=triage.ClaudeRequestError("HTTP 400 bad param")), \
+                mock.patch.object(triage, "_triage_via_local", side_effect=RuntimeError("ollama down")), \
+                mock.patch.object(triage, "load_prompt", return_value="SYSTEM"):
+            with self.assertRaises(RuntimeError) as cm:
+                triage.triage(arts)
+        self.assertIn("HTTP 400 bad param", str(cm.exception))
+        self.assertIn("ollama down", str(cm.exception))
 
 
 # ---------------------------------------------------------------------- output
@@ -386,6 +424,29 @@ class MainTests(EnvTestCase):
         self.assertEqual((rc, status), (3, "skipped"))
         f.assert_not_called()
 
+    def test_bad_model_fails_before_fetching(self):
+        os.environ["TRIAGE_MODEL"] = "claude-nope"
+        with mock.patch.object(main, "fetch_all_with_status") as f:
+            rc, status, _ = main.run()
+        self.assertEqual((rc, status), (1, "fail"))
+        f.assert_not_called()
+        self.assertTrue(list((self.vault / "00-Inbox").glob("*-brief-FAILED.md")))
+
+    def test_missing_vault_is_a_reported_failure(self):
+        os.environ.pop("OBSIDIAN_VAULT_PATH")
+        rc, status, _ = main.run()
+        self.assertEqual((rc, status), (1, "fail"))
+
+    def test_heartbeat_only_when_asked(self):
+        with mock.patch("builtins.open", mock.mock_open()) as m:
+            os.environ.pop("NEWS_AGG_HEARTBEAT", None)
+            main._write_heartbeat("ok")
+            m.assert_not_called()
+            os.environ["NEWS_AGG_HEARTBEAT"] = "1"
+            main._write_heartbeat("degraded", "picks=3")
+            m().write.assert_called_once()
+            self.assertIn(" degraded picks=3", m().write.call_args[0][0])
+
     def test_dead_after_three_failed_runs(self):
         runs = self.vault / "runs"
         for i, ok in enumerate([False, False]):
@@ -415,9 +476,14 @@ class MoverTests(unittest.TestCase):
             (d / sub).mkdir()
             setattr(self.m, attr, str(d / sub))
         self.m.LOG = str(d / "mover.log")
-        self.m.FEEDBACK = str(d / "fb/ticks.json")
+        self.m.FEEDBACK_DIR = str(d / "fb")
         self.notes = []
-        self.m.notify = lambda t, msg: self.notes.append((t, msg))
+        self.ok = True
+        def fake_notify(t, msg):
+            self.notes.append((t, msg))
+            return self.ok
+        self.real_notify = self.m.notify
+        self.m.notify = fake_notify
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -431,28 +497,93 @@ class MoverTests(unittest.TestCase):
         self.assertEqual(sorted(t for t, _ in self.notes), ["News brief FAILED", "News brief degraded"])
         self.assertIn("API down", dict(self.notes)["News brief FAILED"])
 
-    def test_missing_alarm_once(self):
+    def test_missing_alarm_once_and_only_after_wake_grace(self):
         tz = self.m.PT
-        early = datetime(2026, 9, 27, 8, 0, tzinfo=tz)
-        late = datetime(2026, 9, 27, 10, 0, tzinfo=tz)
-        self.m.check_missing(early)
+        long_awake = datetime(2026, 9, 27, 6, 0, tzinfo=tz)
+        self.m.check_missing(datetime(2026, 9, 27, 8, 0, tzinfo=tz), long_awake)  # before 09:30
+        self.m.check_missing(datetime(2026, 9, 27, 10, 0, tzinfo=tz), datetime(2026, 9, 27, 9, 50, tzinfo=tz))  # just woke
         self.assertEqual(self.notes, [])
-        self.m.check_missing(late)
-        self.m.check_missing(late)
+        self.m.check_missing(datetime(2026, 9, 27, 10, 0, tzinfo=tz), long_awake)
+        self.m.check_missing(datetime(2026, 9, 27, 10, 2, tzinfo=tz), long_awake)
         self.assertEqual([t for t, _ in self.notes], ["News brief missing"])
         Path(self.m.VAULT, "2026-09-28-brief.md").write_text("x")
-        self.m.check_missing(datetime(2026, 9, 28, 10, 0, tzinfo=tz))
+        self.m.check_missing(datetime(2026, 9, 28, 10, 0, tzinfo=tz), long_awake)
         self.assertEqual(len(self.notes), 1)
+
+    def test_failed_notification_is_retried(self):
+        tz = self.m.PT
+        self.ok = False
+        self.m.check_missing(datetime(2026, 9, 27, 10, 0, tzinfo=tz), datetime(2026, 9, 27, 6, 0, tzinfo=tz))
+        self.ok = True
+        self.m.check_missing(datetime(2026, 9, 27, 10, 2, tzinfo=tz), datetime(2026, 9, 27, 6, 0, tzinfo=tz))
+        self.assertEqual(len(self.notes), 2)
+
+    def test_awake_since_resets_after_sleep(self):
+        tz = self.m.PT
+        t0 = datetime(2026, 9, 27, 9, 0, tzinfo=tz)
+        self.assertEqual(self.m.awake_since(t0), t0)
+        self.assertEqual(self.m.awake_since(t0 + timedelta(minutes=2)), t0)
+        t1 = t0 + timedelta(hours=2)  # slept
+        self.assertEqual(self.m.awake_since(t1), t1)
+
+    def test_notify_passes_text_as_argv(self):
+        with mock.patch.object(self.m.subprocess, "run", return_value=SimpleNamespace(returncode=0, stderr="")) as run:
+            self.assertTrue(self.real_notify("News brief missing", 'No brief — "quoted" \\ back'))
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[-2:], ['No brief — "quoted" \\ back', "News brief missing"])
+        self.assertTrue(all("brief" not in c for c in cmd[:-2]))  # text never inside the script
+        with mock.patch.object(self.m.subprocess, "run", return_value=SimpleNamespace(returncode=1, stderr="err")):
+            self.assertFalse(self.real_notify("t", "m"))
+
+    def test_stuck_file_alerts(self):
+        Path(self.m.INBOX, "2026-09-27-brief.md").write_text("---\nstatus: ok\n---\n")
+        with mock.patch.object(self.m.shutil, "move", side_effect=PermissionError("TCC denied")), \
+                mock.patch.object(self.m.time, "sleep", lambda s: None):
+            self.m.move_new_files()
+            self.m.move_new_files()
+        self.assertEqual([t for t, _ in self.notes], ["News brief stuck"])
 
     def test_feedback_harvest(self):
         Path(self.m.VAULT, "2026-09-27-brief.md").write_text(
             "- [x] **[A](https://a/1)**\n- [ ] **[B](https://a/2)**\n")
         Path(self.m.VAULT, "2026-06-01-brief.md").write_text("- [x] **[Old](https://a/0)**\n")
         self.m.harvest_feedback(datetime(2026, 9, 28, 10, 0, tzinfo=self.m.PT))
-        data = json.loads(Path(self.m.FEEDBACK).read_text())
-        self.assertEqual(list(data["briefs"]), ["2026-09-27"])
-        self.assertEqual([p["checked"] for p in data["briefs"]["2026-09-27"]], [True, False])
+        self.assertEqual(sorted(os.listdir(self.m.FEEDBACK_DIR)), ["2026-09-27.json"])
+        data = json.loads(Path(self.m.FEEDBACK_DIR, "2026-09-27.json").read_text())
+        self.assertEqual([p["checked"] for p in data["picks"]], [True, False])
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ----------------------------------------------------------------------- replay
+class ReplayTests(EnvTestCase):
+    def setUp(self):
+        super().setUp()
+        from aggregator import replay
+        self.replay = replay
+        self.run = self.vault / "runs" / "2026-09-27_070001"
+        self.run.mkdir(parents=True)
+        (self.run / "user_msg.txt").write_text("Here are 1 articles...\n[1] T")
+        self.prompt = self.dir / "p.md"
+        self.prompt.write_text("SYSTEM")
+
+    def test_dry_run_calls_nothing(self):
+        with mock.patch.object(self.replay, "_triage_via_claude") as call:
+            rc = self.replay.main(["--runs", str(self.run), "--prompt", str(self.prompt), "--out", str(self.dir / "o")])
+        self.assertEqual(rc, 0)
+        call.assert_not_called()
+
+    def test_apply_is_resumable_and_summarized(self):
+        parsed = {"summary": "s", "picks": [{"title": "T", "source": "S", "category": "world", "url": "https://x/1",
+                                             "summary": "directly relevant to Javan", "interest_score": 8, "tags": []}]}
+        with mock.patch.object(self.replay, "_triage_via_claude", return_value=(parsed, "{}")) as call, \
+                mock.patch.object(self.replay, "Anthropic"):
+            args = ["--runs", str(self.run), "--prompt", str(self.prompt), "--reps", "2",
+                    "--out", str(self.dir / "o"), "--apply"]
+            self.replay.main(args)
+            self.replay.main(args)  # second pass reuses the saved results
+        self.assertEqual(call.call_count, 2)
+        summary = (self.dir / "o" / "summary.md").read_text()
+        self.assertIn("| p@claude-sonnet-4-6 | 2/2 | 1.0 | 1.00 | 100% | 100% | 2 |", summary)

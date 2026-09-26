@@ -26,17 +26,24 @@ fi
 # lock every catch-up needs. fetch.py and triage.py have their own per-call
 # limits; this is the backstop for whatever slips past them.
 RUN_LIMIT=45m
-timeout --kill-after=60 "$RUN_LIMIT" env PYTHONPATH=. .venv/bin/python -m aggregator.main
+today=$(date '+%F')
+timeout --kill-after=60 "$RUN_LIMIT" env PYTHONPATH=. NEWS_AGG_HEARTBEAT=1 .venv/bin/python -m aggregator.main
 rc=$?
 
-# A killed run can't report itself (main.py writes the failure note and the
-# heartbeat on its own failures), so do it here: the failure must reach the
-# inbox, not only this log.
-if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-    today=$(date '+%F')
-    reason="the run was killed after $RUN_LIMIT (a hung feed or model call)"
+# A killed or crashed run can't report itself (main.py writes the failure note
+# and the heartbeat on its own failures), so do it here: the failure must reach
+# the inbox, not only this log. rc 3 = today's brief already existed.
+out="$HOME/news_agg_out"
+reported() { for d in "$out/00-Inbox" "$out/delivered"; do
+    [ -e "$d/$today-brief.md" ] || [ -e "$d/$today-brief-FAILED.md" ] && return 0; done; return 1; }
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ] && { [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || ! reported; }; then
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+        reason="the run was killed after $RUN_LIMIT (a hung feed or model call)"
+    else
+        reason="aggregator.main exited $rc without reporting (see cron.log)"
+    fi
     echo "$(date '+%F %T') | ERROR | $reason"
-    inbox="$HOME/news_agg_out/00-Inbox"
+    inbox="$out/00-Inbox"
     if [ ! -e "$inbox/$today-brief.md" ]; then
         mkdir -p "$inbox"
         cat > "$inbox/$today-brief-FAILED.md" <<EOF
@@ -55,7 +62,7 @@ Next: if this was the 07:00 run, the catch-up tries once more between 07:15 and 
 EOF
     fi
     mkdir -p "$HOME/.ops-heartbeats"
-    echo "$(date +%s) fail timeout" > "$HOME/.ops-heartbeats/newsbrief"
+    echo "$(date +%s) fail rc=$rc" > "$HOME/.ops-heartbeats/newsbrief"
 fi
 
 # NOTE: the ops-dashboard heartbeat is written by main.py itself
