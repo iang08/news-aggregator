@@ -25,3 +25,7 @@ URLs returned errors. Each is worth revisiting in a future session.
 - status=None on `/feed/` — likely network/SSL or Cloudflare block
 - Next step: test with curl directly to see actual error
 - Priority: LOW — The Drive covers cars sufficiently
+
+## Resolved 2026-09-26 — Willamette Week, OPB News (HTTP 404 since 2026-05-04)
+
+Both publishers moved to Arc XP; the old `/feed/` and `/news/feed/` paths return 404, which the old fetch logged as "malformed feed, no entries parsed" for 144 days. New URLs: `https://www.wweek.com/arc/outboundfeeds/rss/?outputType=xml` and `https://www.opb.org/arc/outboundfeeds/rss/category/news/?outputType=xml`. Fetch now logs the HTTP status, and a feed failing 3 runs in a row puts a "Dead feeds" banner on the brief.

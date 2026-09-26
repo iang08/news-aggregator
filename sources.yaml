@@ -30,10 +30,10 @@ sources:
     last_reviewed: 2026-04-28
 
   - name: "Hacker News (200+ pts)"
-    url: "https://hnrss.org/frontpage?points=200"
+    url: "https://hnrss.org/newest?points=200&count=100"
     category: ai
     weight: 1.0
-    last_reviewed: 2026-04-28
+    last_reviewed: "2026-09-26"
 
   - name: "r/LocalLLaMA"
     url: "https://www.reddit.com/r/LocalLLaMA/.rss"
@@ -82,16 +82,16 @@ sources:
 
   # ─── Local / PNW ──────────────────────────────────────────────────────
   - name: "Willamette Week"
-    url: "https://www.wweek.com/feed/"
+    url: "https://www.wweek.com/arc/outboundfeeds/rss/?outputType=xml"
     category: local
     weight: 0.7
-    last_reviewed: 2026-05-04
+    last_reviewed: "2026-09-26"
 
   - name: "OPB News"
-    url: "https://www.opb.org/news/feed/"
+    url: "https://www.opb.org/arc/outboundfeeds/rss/category/news/?outputType=xml"
     category: local
     weight: 0.7
-    last_reviewed: 2026-05-04
+    last_reviewed: "2026-09-26"
 
   # ─── Science ──────────────────────────────────────────────────────────
   - name: "Quanta Magazine"
