@@ -21,8 +21,42 @@ if [ -z "${NEWS_AGG_RUN_LOCK_HELD:-}" ]; then
     fi
 fi
 
-PYTHONPATH=. .venv/bin/python -m aggregator.main
+# Hard limit on the whole pipeline. A normal run takes ~1 min and the local
+# fallback ~5; anything near 45 min is hung — and while it hangs it holds the
+# lock every catch-up needs. fetch.py and triage.py have their own per-call
+# limits; this is the backstop for whatever slips past them.
+RUN_LIMIT=45m
+timeout --kill-after=60 "$RUN_LIMIT" env PYTHONPATH=. .venv/bin/python -m aggregator.main
 rc=$?
+
+# A killed run can't report itself (main.py writes the failure note and the
+# heartbeat on its own failures), so do it here: the failure must reach the
+# inbox, not only this log.
+if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    today=$(date '+%F')
+    reason="the run was killed after $RUN_LIMIT (a hung feed or model call)"
+    echo "$(date '+%F %T') | ERROR | $reason"
+    inbox="$HOME/news_agg_out/00-Inbox"
+    if [ ! -e "$inbox/$today-brief.md" ]; then
+        mkdir -p "$inbox"
+        cat > "$inbox/$today-brief-FAILED.md" <<EOF
+---
+type: news-brief-failure
+date: $today
+status: fail
+---
+# ⚠️ News brief FAILED — $today
+
+The run on EVO-X2 at $(date '+%H:%M') did not produce a brief.
+
+**Reason:** $reason
+
+Next: if this was the 07:00 run, the catch-up tries once more between 07:15 and 22:00. Details are in cron.log on EVO-X2 (~/projects/news_agg).
+EOF
+    fi
+    mkdir -p "$HOME/.ops-heartbeats"
+    echo "$(date +%s) fail timeout" > "$HOME/.ops-heartbeats/newsbrief"
+fi
 
 # NOTE: the ops-dashboard heartbeat is written by main.py itself
 # (_write_heartbeat -> ~/.ops-heartbeats/newsbrief), so we don't beat here.

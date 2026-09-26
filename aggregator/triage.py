@@ -8,17 +8,21 @@ calls the Claude API, parses the JSON response, returns a TriageResult.
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
+import anthropic
 import httpx
 from anthropic import Anthropic
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 from aggregator.fetch import Article
 
@@ -31,8 +35,30 @@ logger = logging.getLogger(__name__)
 # resolve the mid-stream stalls we've been seeing on the 7am cron.
 MODEL = "claude-sonnet-4-6"
 
-# Maximum tokens Claude can return. ~12 picks × ~200 tokens each + headroom = 4000.
-MAX_TOKENS = 4000
+# Request parameters differ by model, and a wrong one is a 400 — on 2026-09-25
+# Haiku 4.5 rejected `effort` and Opus 5.5 rejected disabled thinking. Before
+# this table, a model swap would have silently turned every brief into a
+# local-fallback brief. A model missing here fails at startup instead.
+#   effort:   output_config.effort, or None to omit (Haiku 4.5 has none)
+#   thinking: the `thinking` param, or None to omit (Opus 5.5 can't disable it;
+#             omitting = adaptive, kept short by effort=low; Haiku 4.5 omitted =
+#             no thinking)
+MODEL_PARAMS: dict[str, dict] = {
+    "claude-sonnet-4-6": {"effort": "low", "thinking": {"type": "disabled"}},
+    "claude-sonnet-5": {"effort": "low", "thinking": {"type": "disabled"}},
+    "claude-opus-5-5": {"effort": "low", "thinking": None},
+    "claude-haiku-4-5": {"effort": None, "thinking": None},
+}
+
+# Maximum tokens Claude can return. ~12 picks × ~300 tokens is ~4k, but Sonnet 5
+# returned 14 picks and Opus 5.5 spends some of this on thinking; a response cut
+# at the cap is unparseable, and unused headroom costs nothing.
+MAX_TOKENS = 16000
+
+# The brief shows at most this many picks, best first. The model fills ~12
+# slots whatever the day (87/99 briefs had exactly 12, 15% of picks scored <= 6),
+# and Sonnet 5 returned 14, so the cap lives in code, not in the prompt.
+MAX_PICKS = 12
 
 # Structured-output schema for the triage response. Passed as
 # output_config.format so the API CONSTRAINS the model to emit valid,
@@ -102,6 +128,22 @@ STREAM_RETRY_BACKOFF_S = 30
 # silence is unambiguously a stall. We then catch it and retry fast.
 STREAM_INACTIVITY_TIMEOUT_S = 60.0
 
+# API errors worth retrying: rate limits, overload and server errors. Anything
+# else (400 bad parameter, 401/403 key, 404 model) is a bug in the request —
+# retrying can't fix it, so it goes straight to the fallback with a loud reason.
+# An overload that arrives mid-stream surfaces as an SSE error event, so the
+# error `type` is checked as well as the HTTP status.
+RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504, 529}
+RETRYABLE_ERROR_TYPES = {"overloaded_error", "api_error", "rate_limit_error", "timeout_error"}
+
+
+class ClaudeRequestError(RuntimeError):
+    """Claude rejected the request itself (4xx, refusal) — retrying won't help."""
+
+
+class ClaudeTruncatedError(RuntimeError):
+    """The response hit max_tokens, so its JSON is incomplete."""
+
 # Local fallback (EVO-X2 Ollama). When Claude exhausts all its retries on a
 # bad-API morning (e.g. 2026-06-12: 3 hours of mid-stream stalls, no brief),
 # fall back to a local model so the brief STILL ships — slower (~4 min) and
@@ -117,6 +159,14 @@ LOCAL_KEEP_ALIVE = "2m"      # short — EVO-X2 is shared; don't hold RAM after 
 LOCAL_TIMEOUT_S = 600.0      # generous: a 35B model on ~25k tokens takes ~4 min
 LOCAL_ATTEMPTS = 2
 LOCAL_RETRY_BACKOFF_S = 15
+# Context window: sized from the real prompt plus room for the answer, capped.
+# Japanese text is ~1 token per character, so a chars/3 estimate undercounts it,
+# and an undersized num_ctx makes Ollama silently drop the start of the prompt.
+LOCAL_OUTPUT_ROOM = 6000
+LOCAL_MAX_CTX = 65536
+# Don't load a second ~23 GB model onto the shared box when it's already tight
+# (GECK's own 35B runs there too). Checked only for a local Ollama.
+LOCAL_MIN_AVAIL_GB = 30
 
 # Cross-day dedup. The brief is otherwise stateless — each run re-triages the
 # last 24h with no memory of what it featured before, so major multi-day
@@ -132,6 +182,44 @@ BRIEF_HISTORY_DAYS = 5
 _PICK_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 _BRIEF_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})-brief\.md$")
 
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+
+
+def load_env() -> None:
+    """Load .env WITHOUT overriding variables the caller set on purpose — a dry
+    run's OBSIDIAN_VAULT_PATH or an experiment's BRIEF_HISTORY_DIRS used to be
+    silently replaced by .env values (override=True), sending test briefs to the
+    real inbox. The one exception is the API key: Ian's interactive shell exports
+    ANTHROPIC_API_KEY= (empty), which must not shadow the .env key."""
+    load_dotenv(ENV_PATH, override=False)
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        key = dotenv_values(ENV_PATH).get("ANTHROPIC_API_KEY")
+        if key:
+            os.environ["ANTHROPIC_API_KEY"] = key
+
+
+def triage_model() -> str:
+    """The Claude model to use: TRIAGE_MODEL from the environment, else MODEL."""
+    model = os.getenv("TRIAGE_MODEL") or MODEL
+    if model not in MODEL_PARAMS:
+        raise ValueError(
+            f"TRIAGE_MODEL={model!r} has no entry in MODEL_PARAMS; add its "
+            f"effort/thinking settings before using it (known: {', '.join(MODEL_PARAMS)})"
+        )
+    return model
+
+
+def request_params(model: str) -> dict:
+    """Keyword arguments for messages.stream() that depend on the model."""
+    cfg = MODEL_PARAMS[model]
+    output_config: dict = {"format": {"type": "json_schema", "schema": TRIAGE_SCHEMA}}
+    if cfg["effort"]:
+        output_config["effort"] = cfg["effort"]
+    params: dict = {"output_config": output_config}
+    if cfg["thinking"] is not None:
+        params["thinking"] = cfg["thinking"]
+    return params
+
 
 def _history_dirs() -> list[str]:
     """Directories to scan for past briefs (read AFTER load_dotenv)."""
@@ -143,16 +231,20 @@ def _history_dirs() -> list[str]:
     return [os.path.join(vault, folder)] if vault else []
 
 
-def _recent_brief_history(dirs: list[str], days: int) -> tuple[set[str], list[str]]:
+def _recent_brief_history(
+    dirs: list[str], days: int, exclude_date: str | None = None
+) -> tuple[set[str], list[str]]:
     """Return (seen_urls, recent_picks) from the most recent `days` distinct
-    brief files across `dirs`. Best-effort — any error returns ([], []) so dedup
-    can never break the brief."""
+    brief files across `dirs`, skipping `exclude_date` — a same-day re-run must
+    not dedup against the very brief it is replacing (it dropped 12/12 of the
+    morning's picks). Best-effort — any error returns ([], []) so dedup can
+    never break the brief."""
     try:
         by_date: dict[str, str] = {}
         for d in dirs:
             for path in glob.glob(os.path.join(d, "*-brief.md")):
                 m = _BRIEF_DATE_RE.search(os.path.basename(path))
-                if m:
+                if m and m.group(1) != exclude_date:
                     by_date.setdefault(m.group(1), path)  # one file per date
         seen_urls: set[str] = set()
         recent_picks: list[str] = []
@@ -190,6 +282,12 @@ class TriageResult:
     article_count_in: int  # How many articles were considered
     raw_response: str  # The model's raw output, for debugging
     engine: str = "claude"  # which model produced this — "claude:..." or "local:..."
+    # Everything needed to replay or audit the run (saved by main.py):
+    dropped: list[TriagePick] = field(default_factory=list)  # over MAX_PICKS or duplicate URL
+    fallback_reason: str = ""   # why Claude wasn't used, when engine is local
+    system_prompt: str = ""
+    user_msg: str = ""
+    meta: dict = field(default_factory=dict)  # model, params, usage, stop_reason, request_id, attempts
 
 
 def load_prompt(path: Path = Path("prompts/triage.md")) -> str:
@@ -203,7 +301,8 @@ def format_articles_for_claude(articles: list[Article]) -> str:
     """Format articles as a numbered list for Claude to read."""
     lines = []
     for i, art in enumerate(articles, start=1):
-        # Trim summary to keep input token count reasonable
+        # Trim summary to keep input token count reasonable (fetch.py already
+        # stripped the HTML, so these 300 chars are all readable text)
         summary = art.summary[:300].replace("\n", " ").strip()
         lines.append(
             f"[{i}] {art.title}\n"
@@ -233,12 +332,47 @@ def _parse_triage_json(raw: str) -> dict:
     return json.loads(json_text)
 
 
-def _triage_via_claude(client: Anthropic, system_prompt: str, user_msg: str) -> tuple[dict, str]:
+def _api_error_type(e: anthropic.APIStatusError) -> str:
+    """The Anthropic error `type` (e.g. "overloaded_error") from an API error."""
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("type"):
+            return str(err["type"])
+        if body.get("type") and body.get("type") != "error":
+            return str(body["type"])
+    return ""
+
+
+def _is_retryable(e: anthropic.APIStatusError) -> bool:
+    return e.status_code in RETRYABLE_STATUS or _api_error_type(e) in RETRYABLE_ERROR_TYPES
+
+
+def _message_text(message) -> str:
+    """Concatenate the text blocks. The first block isn't always text — with
+    thinking on (Opus 5.5 can't turn it off) it's a thinking block."""
+    return "".join(b.text for b in message.content if getattr(b, "type", "") == "text")
+
+
+def _usage_dict(message) -> dict:
+    usage = getattr(message, "usage", None)
+    try:
+        return usage.model_dump(exclude_none=True) if usage is not None else {}
+    except Exception:  # noqa: BLE001 — usage is diagnostics only
+        return {}
+
+
+def _triage_via_claude(
+    client: Anthropic, model: str, system_prompt: str, user_msg: str, meta: dict
+) -> tuple[dict, str]:
     """Primary path: stream from Claude with structured output, per-event
-    instrumentation, and the stall/JSON retry loop. Returns (parsed, raw).
-    Raises after MAX_STREAM_ATTEMPTS if the API never delivers a complete,
-    parseable response — the caller decides whether to fall back."""
+    instrumentation, and the stall/overload/JSON retry loop. Returns (parsed,
+    raw) and fills `meta` (usage, stop_reason, request_id, attempts). Raises
+    ClaudeRequestError / ClaudeTruncatedError at once for problems a retry
+    can't fix, and re-raises after MAX_STREAM_ATTEMPTS otherwise — the caller
+    decides whether to fall back."""
     raw = ""
+    attempts: list[dict] = meta.setdefault("attempts", [])
     for attempt in range(1, MAX_STREAM_ATTEMPTS + 1):
         stream_start = time.monotonic()
         first_event_at: float | None = None
@@ -246,21 +380,16 @@ def _triage_via_claude(client: Anthropic, system_prompt: str, user_msg: str) -> 
         event_count = 0
         try:
             with client.messages.stream(
-                model=MODEL,
+                model=model,
                 max_tokens=MAX_TOKENS,
-                # effort="low": Sonnet 4.6 defaults to effort="high" (4.5 had
-                #   no effort param). For a classification/extraction task that's
-                #   wasteful, and high effort means longer generation — the exact
-                #   condition that triggers mid-stream stalls. low + thinking
-                #   disabled matches the no-thinking behavior we had on 4.5.
+                # Per-model effort/thinking + structured output — see MODEL_PARAMS.
+                # effort="low": for a classification/extraction task high effort
+                #   is wasteful and means longer generation — the exact condition
+                #   that triggers mid-stream stalls.
                 # format: structured output — the API constrains the response to
                 #   valid JSON matching TRIAGE_SCHEMA, so a model-emitted title
                 #   with unescaped quotes can no longer produce unparseable JSON.
-                output_config={
-                    "effort": "low",
-                    "format": {"type": "json_schema", "schema": TRIAGE_SCHEMA},
-                },
-                thinking={"type": "disabled"},
+                **request_params(model),
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_msg}],
             ) as stream:
@@ -291,17 +420,51 @@ def _triage_via_claude(client: Anthropic, system_prompt: str, user_msg: str) -> 
                 f"stream complete: {event_count} events ({delta_count} deltas) "
                 f"in {total:.2f}s; first event at t+{first_event_at:.2f}s"
             )
+            meta.update(
+                usage=_usage_dict(message),
+                stop_reason=message.stop_reason,
+                request_id=getattr(message, "_request_id", None),
+            )
+            attempts.append({"attempt": attempt, "seconds": round(total, 1), "error": None})
+            logger.info(f"usage: {meta['usage']}; stop_reason={message.stop_reason}; request_id={meta['request_id']}")
+
+            if message.stop_reason == "max_tokens":
+                raise ClaudeTruncatedError(
+                    f"response hit max_tokens={MAX_TOKENS}; the JSON is incomplete"
+                )
+            if message.stop_reason == "refusal":
+                raise ClaudeRequestError(f"model refused the request: {getattr(message, 'stop_details', None)}")
 
             # Parse INSIDE the retry loop so a malformed-JSON response retries
             # instead of nuking the whole brief. With structured output this
             # should never fail, but the retry is cheap insurance.
-            raw = message.content[0].text
+            raw = _message_text(message)
             logger.info(f"Claude responded with {len(raw)} characters")
             return _parse_triage_json(raw), raw  # success — valid stream AND JSON
-        except (httpx.RemoteProtocolError, httpx.ReadTimeout) as e:
+        except (ClaudeRequestError, ClaudeTruncatedError):
+            raise
+        except anthropic.APIStatusError as e:
+            etype = _api_error_type(e)
+            attempts.append({"attempt": attempt, "seconds": round(time.monotonic() - stream_start, 1),
+                             "error": f"HTTP {e.status_code} {etype}".strip()})
+            if not _is_retryable(e):
+                raise ClaudeRequestError(
+                    f"Claude rejected the request (HTTP {e.status_code} {etype}): {getattr(e, 'message', e)}"
+                ) from e
+            if attempt == MAX_STREAM_ATTEMPTS:
+                logger.error(f"API error on attempt {attempt}/{MAX_STREAM_ATTEMPTS} (HTTP {e.status_code} {etype}); giving up")
+                raise
+            logger.warning(
+                f"API error on attempt {attempt}/{MAX_STREAM_ATTEMPTS} (HTTP {e.status_code} {etype}); "
+                f"retrying in {STREAM_RETRY_BACKOFF_S}s"
+            )
+            time.sleep(STREAM_RETRY_BACKOFF_S)
+        except (httpx.RemoteProtocolError, httpx.ReadTimeout, anthropic.APIConnectionError) as e:
             # Mid-stream stall (diagnosed from 5/28 instrumented logs):
             #   - ReadTimeout: bytes stopped for STREAM_INACTIVITY_TIMEOUT_S
             #   - RemoteProtocolError: connection closed when httpx tried to read
+            # APIConnectionError/APITimeoutError: the SDK's own connection
+            # retries ran out before the stream started.
             failure_elapsed = time.monotonic() - stream_start
             diag = (
                 f"after {failure_elapsed:.2f}s; "
@@ -309,13 +472,15 @@ def _triage_via_claude(client: Anthropic, system_prompt: str, user_msg: str) -> 
                 f"first event at t+{first_event_at:.2f}s" if first_event_at is not None
                 else f"after {failure_elapsed:.2f}s; ZERO events received (no message_start)"
             )
+            attempts.append({"attempt": attempt, "seconds": round(failure_elapsed, 1),
+                             "error": f"{type(e).__name__}"})
             if attempt == MAX_STREAM_ATTEMPTS:
                 logger.error(
-                    f"Stream attempt {attempt}/{MAX_STREAM_ATTEMPTS} closed by server; giving up. {diag}"
+                    f"Stream attempt {attempt}/{MAX_STREAM_ATTEMPTS} failed ({type(e).__name__}); giving up. {diag}"
                 )
                 raise
             logger.warning(
-                f"Stream attempt {attempt}/{MAX_STREAM_ATTEMPTS} closed by server ({e}); "
+                f"Stream attempt {attempt}/{MAX_STREAM_ATTEMPTS} failed ({type(e).__name__}: {e}); "
                 f"retrying in {STREAM_RETRY_BACKOFF_S}s. {diag}"
             )
             time.sleep(STREAM_RETRY_BACKOFF_S)
@@ -323,6 +488,7 @@ def _triage_via_claude(client: Anthropic, system_prompt: str, user_msg: str) -> 
             # Structured output makes this near-impossible, but if it happens,
             # retry rather than nuking the brief. (Partial-JSON salvage was
             # considered and rejected: fragile, and structured output moots it.)
+            attempts[-1]["error"] = "JSONDecodeError"
             if attempt == MAX_STREAM_ATTEMPTS:
                 logger.error(
                     f"JSON parse failed on attempt {attempt}/{MAX_STREAM_ATTEMPTS} "
@@ -337,8 +503,50 @@ def _triage_via_claude(client: Anthropic, system_prompt: str, user_msg: str) -> 
     raise RuntimeError("unreachable: loop returns or raises")  # for the type checker
 
 
+def estimate_tokens(text: str) -> int:
+    """Rough token count: ~3.5 chars per token for ASCII, ~1 token per char for
+    everything else (Japanese). Deliberately errs high."""
+    non_ascii = sum(1 for ch in text if ord(ch) > 127)
+    return int((len(text) - non_ascii) / 3.5 + non_ascii * 1.1)
+
+
+def local_num_ctx(system_prompt: str, user_msg: str) -> int:
+    """num_ctx for Ollama: prompt estimate + answer room, rounded up to 4k.
+    Raises if even LOCAL_MAX_CTX can't hold it — a silently truncated prompt
+    is worse than a loud failure."""
+    need = estimate_tokens(system_prompt) + estimate_tokens(user_msg) + LOCAL_OUTPUT_ROOM
+    if need > LOCAL_MAX_CTX:
+        raise RuntimeError(f"prompt needs ~{need} tokens of context; the local fallback allows {LOCAL_MAX_CTX}")
+    return max(16384, math.ceil(need / 4096) * 4096)
+
+
+def _local_memory_guard(ollama_host: str, local_model: str) -> None:
+    """Refuse to load the fallback model onto the shared box when memory is
+    tight, unless it is already loaded. Only applies to a local Ollama on Linux."""
+    if not any(h in ollama_host for h in ("localhost", "127.0.0.1")):
+        return
+    try:
+        with open("/proc/meminfo") as f:
+            avail_kb = next(int(line.split()[1]) for line in f if line.startswith("MemAvailable:"))
+    except (OSError, StopIteration, ValueError):
+        return
+    avail_gb = avail_kb / 1024 / 1024
+    if avail_gb >= LOCAL_MIN_AVAIL_GB:
+        return
+    try:
+        loaded = [m.get("name", "") for m in httpx.get(f"{ollama_host}/api/ps", timeout=10).json().get("models", [])]
+    except (httpx.HTTPError, ValueError):
+        loaded = []
+    if local_model in loaded:
+        return
+    raise RuntimeError(
+        f"only {avail_gb:.0f} GB available on the box; not loading {local_model} "
+        f"(needs >= {LOCAL_MIN_AVAIL_GB} GB free)"
+    )
+
+
 def _triage_via_local(
-    system_prompt: str, user_msg: str, ollama_host: str, local_model: str
+    system_prompt: str, user_msg: str, ollama_host: str, local_model: str, meta: dict
 ) -> tuple[dict, str]:
     """Fallback path: EVO-X2 Ollama with the SAME prompt + schema. Slower
     (~4 min) and slightly lower quality than Claude, but deterministic and
@@ -347,13 +555,11 @@ def _triage_via_local(
 
     num_ctx is sized from the real prompt — the article block is large, and
     an undersized context window silently truncates the input. keep_alive is
-    pinned short because EVO-X2 is a shared box (don't hold 35B in RAM)."""
-    approx_tokens = (len(system_prompt) + len(user_msg)) // 3
-    num_ctx = 32768 if approx_tokens < 30000 else 49152
-    logger.info(
-        f"Local fallback: {local_model} @ {ollama_host} "
-        f"(num_ctx={num_ctx}, ~{approx_tokens} input tokens)"
-    )
+    pinned short because EVO-X2 is a shared box (don't hold 35B in RAM).
+    think=False: Qwen3.6 reasons by default, which only adds minutes here."""
+    num_ctx = local_num_ctx(system_prompt, user_msg)
+    _local_memory_guard(ollama_host, local_model)
+    logger.info(f"Local fallback: {local_model} @ {ollama_host} (num_ctx={num_ctx})")
     t0 = time.monotonic()
     last_err: Exception | None = None
     for attempt in range(1, LOCAL_ATTEMPTS + 1):
@@ -368,14 +574,24 @@ def _triage_via_local(
                     ],
                     "format": TRIAGE_SCHEMA,  # Ollama structured output — same schema
                     "stream": False,
+                    "think": False,
                     "keep_alive": LOCAL_KEEP_ALIVE,
                     "options": {"num_ctx": num_ctx, "temperature": 0.3},
                 },
                 timeout=LOCAL_TIMEOUT_S,
             )
             resp.raise_for_status()
-            raw = resp.json()["message"]["content"]
+            body = resp.json()
+            raw = body["message"]["content"]
             parsed = _parse_triage_json(raw)
+            meta.update(
+                local_model=local_model,
+                num_ctx=num_ctx,
+                usage={"prompt_eval_count": body.get("prompt_eval_count"), "eval_count": body.get("eval_count")},
+                local_seconds=round(time.monotonic() - t0, 1),
+            )
+            if (body.get("prompt_eval_count") or 0) >= num_ctx:
+                logger.warning(f"Local fallback: prompt filled num_ctx={num_ctx}; input may have been truncated")
             logger.info(
                 f"Local fallback complete in {time.monotonic() - t0:.1f}s, {len(raw)} chars"
             )
@@ -394,17 +610,34 @@ def _triage_via_local(
     ) from last_err
 
 
+def finalize_picks(picks: list[TriagePick]) -> tuple[list[TriagePick], list[TriagePick]]:
+    """Best first, one entry per URL, at most MAX_PICKS. Returns (kept, dropped)."""
+    seen: set[str] = set()
+    kept: list[TriagePick] = []
+    dropped: list[TriagePick] = []
+    for p in sorted(picks, key=lambda p: -p.interest_score):  # stable: ties keep model order
+        if p.url in seen or len(kept) >= MAX_PICKS:
+            dropped.append(p)
+        else:
+            seen.add(p.url)
+            kept.append(p)
+    return kept, dropped
+
+
 def triage(articles: list[Article]) -> TriageResult:
     """Triage articles into a brief. Tries Claude first; on a total Claude
-    failure (stalls/timeouts exhausted), falls back to the EVO-X2 local model
-    so the brief still ships. Set TRIAGE_LOCAL_FALLBACK=0 to disable fallback."""
+    failure (stalls/timeouts exhausted, or a request Claude rejects), falls back
+    to the EVO-X2 local model so the brief still ships — with the reason
+    recorded so the brief and the heartbeat say so. Set
+    TRIAGE_LOCAL_FALLBACK=0 to disable fallback."""
     if not articles:
         raise ValueError("No articles to triage — fetch returned empty list")
 
-    load_dotenv(override=True)  # override: shell may export an empty ANTHROPIC_API_KEY
+    load_env()
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set. Check your .env file.")
+    model = triage_model()
 
     client = Anthropic(
         api_key=api_key,
@@ -417,7 +650,9 @@ def triage(articles: list[Article]) -> TriageResult:
 
     # Cross-day dedup: drop articles already featured in recent briefs
     # (deterministic), and tell the model which topics were just covered.
-    seen_urls, recent_picks = _recent_brief_history(_history_dirs(), BRIEF_HISTORY_DAYS)
+    today = datetime.now().strftime("%Y-%m-%d")
+    seen_urls, recent_picks = _recent_brief_history(_history_dirs(), BRIEF_HISTORY_DAYS, exclude_date=today)
+    dropped = 0
     if seen_urls:
         before = len(articles)
         articles = [a for a in articles if a.link not in seen_urls]
@@ -441,7 +676,7 @@ def triage(articles: list[Article]) -> TriageResult:
             + "\n".join(f"- {p}" for p in recent_picks)
         )
 
-    logger.info(f"Sending {len(articles)} articles to Claude for triage...")
+    logger.info(f"Sending {len(articles)} articles to Claude ({model}) for triage...")
 
     user_msg = (
         f"Here are {len(articles)} articles from the last 24 hours. "
@@ -450,25 +685,38 @@ def triage(articles: list[Article]) -> TriageResult:
         f"{article_block}"
     )
 
-    # Fallback config (read after load_dotenv so .env can override).
+    # Fallback config (read after load_env so .env can supply it).
     fallback_enabled = os.getenv("TRIAGE_LOCAL_FALLBACK", "1") != "0"
     ollama_host = os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
     local_model = os.getenv("TRIAGE_LOCAL_MODEL", DEFAULT_LOCAL_MODEL)
 
-    # Claude is primary. On a TOTAL Claude failure (stalls/timeouts/parse all
-    # exhausted), fall back to the local model so the brief still ships rather
-    # than producing nothing — which is what happened 2026-06-12.
-    engine = f"claude:{MODEL}"
+    meta: dict = {
+        "model": model,
+        "params": {k: v for k, v in request_params(model).items() if k != "output_config"}
+        | {"effort": MODEL_PARAMS[model]["effort"], "max_tokens": MAX_TOKENS},
+        "prompt_sha256": hashlib.sha256(system_prompt.encode()).hexdigest(),
+        "articles_after_dedup": len(articles),
+        "dedup_dropped": dropped,
+    }
+
+    # Claude is primary. On a TOTAL Claude failure, fall back to the local model
+    # so the brief still ships rather than producing nothing — which is what
+    # happened 2026-06-12. The reason travels with the result: a fallback brief
+    # caused by a bad request (e.g. a model swap) must not look like a bad
+    # Anthropic morning.
+    engine = f"claude:{model}"
+    fallback_reason = ""
     try:
-        parsed, raw = _triage_via_claude(client, system_prompt, user_msg)
+        parsed, raw = _triage_via_claude(client, model, system_prompt, user_msg, meta)
     except Exception as claude_err:
+        fallback_reason = f"{type(claude_err).__name__}: {claude_err}"[:300]
         if not fallback_enabled:
             raise
         logger.error(
-            f"Claude triage failed ({type(claude_err).__name__}: {claude_err}). "
-            f"Falling back to the local model on EVO-X2 so the brief still ships."
+            f"Claude triage failed ({fallback_reason}). "
+            f"Falling back to the local model so the brief still ships."
         )
-        parsed, raw = _triage_via_local(system_prompt, user_msg, ollama_host, local_model)
+        parsed, raw = _triage_via_local(system_prompt, user_msg, ollama_host, local_model, meta)
         engine = f"local:{local_model}"
         logger.info(f"Brief generated via FALLBACK engine: {engine}")
 
@@ -484,13 +732,24 @@ def triage(articles: list[Article]) -> TriageResult:
         )
         for p in parsed.get("picks", [])
     ]
+    kept, dropped_picks = finalize_picks(picks)
+    if dropped_picks:
+        logger.info(
+            f"Picks: kept {len(kept)}, dropped {len(dropped_picks)} "
+            f"(scores {', '.join(str(p.interest_score) for p in dropped_picks)})"
+        )
 
     return TriageResult(
         summary=parsed.get("summary", "(no summary)"),
-        picks=picks,
+        picks=kept,
         article_count_in=len(articles),
         raw_response=raw,
         engine=engine,
+        dropped=dropped_picks,
+        fallback_reason=fallback_reason,
+        system_prompt=system_prompt,
+        user_msg=user_msg,
+        meta=meta,
     )
 
 
