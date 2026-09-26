@@ -7,6 +7,20 @@ set -uo pipefail
 
 cd "$HOME/projects/news_agg" || exit 1
 
+# One pipeline at a time, however it was started (07:00 cron, catchup.sh, or by
+# hand): two runs could both load the local fallback model on a shared box, and
+# a second run overwrites today's brief. catchup.sh takes this lock itself and
+# hands it down (NEWS_AGG_RUN_LOCK_HELD=1) so its check-then-run is atomic.
+if [ -z "${NEWS_AGG_RUN_LOCK_HELD:-}" ]; then
+    LOCK="$HOME/.local/state/news_agg/run.lock"
+    mkdir -p "${LOCK%/*}"
+    exec 9>"$LOCK"
+    if ! flock -n 9; then
+        echo "$(date '+%F %T') another news_agg run holds $LOCK; not starting a second" >&2
+        exit 75
+    fi
+fi
+
 PYTHONPATH=. .venv/bin/python -m aggregator.main
 rc=$?
 
