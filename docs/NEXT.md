@@ -36,6 +36,10 @@ Work in a fresh worktree off `origin/main` on the Mac (other sessions share `~/p
 
 From `runs/*/run.json` (per-source status) and `picks.json`: per feed — items in pool, picks, pick rate, failures, stale flags, capped counts. After only 3–4 days, report; don't drop anything yet. Real verdicts after ~14 runs (keep: ≥1 pick and not mostly unticked; tighten: pool share >3× pick share; drop: 0 picks from ≥10 items or a persistent dead/stale flag; feeds under 0.2/day get 8 weeks).
 
+## 2b. People feeds and paywall filters (added 2026-09-26)
+
+36 people feeds (`docs/people-2026-09-26.md`) and the paywall filters went in on 2026-09-26. In the early source read, report per people feed: items, picks, paid_skipped, and whether it was stale; and per filter: how many items each rule dropped (run.json `sources[].paid_skipped`). **PubMed:** both saved-search feeds returned an empty channel on the evening of 09-26 after working that afternoon (NCBI throttling EVO-X2, or the saved searches expiring). If they are still empty, replace them with NCBI E-utilities (esearch + esummary for the same queries, free-full-text filter) rather than the RSS.
+
 ## 3. Dynamic fetch window (audit X3) — DONE (e44112f)
 
 `main.fetch_window_hours`: hours since the newest earlier `*-brief.md` was written (file mtime, not `run.json`) + 0.5, clamped to 28–48 h; per-feed `window_hours` only reaches further back. Recorded as `hours_back` in `run.json`.

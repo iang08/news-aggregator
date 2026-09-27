@@ -54,6 +54,48 @@ SHORT_SUMMARY_CHARS = 80
 # An entry dated this far in the future is a pinned post or a bad date (one
 # blog pins a post dated year 9999) and would otherwise sit in every pool.
 FUTURE_SLACK = timedelta(hours=1)
+# ---- No paywalled articles (Ian subscribes to nothing). Verified 2026-09-26.
+# Substack paid posts end their content:encoded with a bare "Read more" link
+# (13/13 paid flagged, 0/37 free). Only for feeds whose generator is Substack:
+# WordPress feeds end every summary with "Read more" too.
+_SUBSTACK_PAID_RE = re.compile(r"<a\b[^>]*>\s*Read more\s*</a>\s*(?:</p>)?\s*$")
+# Outlets whose articles are (nearly) all paywalled, as linked from Hacker
+# News, Hatena and Google News (Google News also names the outlet in <source>).
+PAYWALLED_HOSTS = (
+    "economist.com", "bloomberg.com", "wsj.com", "nytimes.com", "ft.com", "washingtonpost.com",
+    "theatlantic.com", "newyorker.com", "wired.com", "businessinsider.com", "smh.com.au",
+    "theinformation.com", "nikkei.com", "netdenjd.com", "courrier.jp", "diamond.jp",
+    "newspicks.com", "mainichi.jp", "japantimes.co.jp",
+)
+# Pages that say so in their JSON-LD: note.com always (free and paid teasers
+# look the same in the feed), and feeds marked check_access (Nature).
+_NOT_FREE_RE = re.compile(r'"isAccessibleForFree"\s*:\s*(?:false|"False")')
+ACCESS_CHECK_HOSTS = ("note.com",)
+ACCESS_CHECK_TIMEOUT_S = 20.0
+
+
+def _host(url: str) -> str:
+    try:
+        return urlsplit(url).netloc.lower().split(":")[0]
+    except ValueError:
+        return ""
+
+
+def _host_in(host: str, hosts: tuple[str, ...]) -> bool:
+    return any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def page_is_free(url: str) -> bool:
+    """One GET of the article page; False if its JSON-LD says it isn't free,
+    and False if the page can't be read (fail closed — no paywalled articles)."""
+    try:
+        r = httpx.get(url, timeout=ACCESS_CHECK_TIMEOUT_S, follow_redirects=True,
+                      headers={"User-Agent": feedparser.USER_AGENT})
+    except httpx.HTTPError:
+        return False
+    return r.status_code == 200 and not _NOT_FREE_RE.search(r.text)
+
+
 # A feed whose newest post is older than max(STALE_MIN, STALE_GAPS x its own
 # median gap between posts) has probably frozen, even though it answers 200.
 STALE_MIN = timedelta(days=21)
@@ -90,6 +132,7 @@ class SourceStatus:
     capped: int = 0                # in-window entries dropped by max_items
     window_truncated: bool = False  # feed's own item cap ends inside the window
     future_skipped: int = 0        # entries dated in the future (pinned posts)
+    paid_skipped: int = 0          # paywalled items left out (Substack paid, paywalled outlet, page check)
     newest_age_h: float | None = None
     stale: bool = False            # no new post for much longer than usual
 
@@ -225,6 +268,8 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article
     oldest_dated: datetime | None = None
     dated: list[datetime] = []
     now = datetime.now(timezone.utc)
+    substack = (feed.feed.get("generator") or "").strip() == "Substack"
+    feed_host = _host(source["url"])
     for entry in feed.entries:
         # Get published time — feedparser exposes it as a struct_time
         published_parsed = entry.get("published_parsed") or entry.get("updated_parsed")
@@ -244,6 +289,17 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article
         if published < cutoff:
             continue  # Too old
 
+        link = canonical_link(entry.get("link", ""))
+        u_host = _host(link)
+        if u_host == feed_host and urlsplit(link).path in ("", "/"):
+            continue  # a stub pointing at the feed's own homepage (hamel.dev's off-site posts)
+        via = (entry.get("source") or {}).get("href", "")  # Google News names the outlet here
+        raw_content = entry["content"][0].get("value", "") if entry.get("content") else ""
+        if (_host_in(u_host, PAYWALLED_HOSTS) or (via and _host_in(_host(via), PAYWALLED_HOSTS))
+                or (substack and _SUBSTACK_PAID_RE.search(raw_content.strip()))):
+            status.paid_skipped += 1
+            continue
+
         summary = _entry_text(entry.get("summary"), entry.get("summary_detail"))
         if (len(summary) < SHORT_SUMMARY_CHARS or "appeared first on" in summary) and entry.get("content"):
             body = _entry_text(entry["content"][0].get("value", ""), entry["content"][0])
@@ -251,7 +307,7 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article
                 summary = body
         articles.append(Article(
             title=_entry_text(entry.get("title"), entry.get("title_detail")) or "(no title)",
-            link=canonical_link(entry.get("link", "")),
+            link=link,
             summary=summary[:SUMMARY_MAX_CHARS],
             published=published,
             source_name=name,
@@ -284,7 +340,21 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article
         hours = (datetime.now(timezone.utc) - oldest_dated).total_seconds() / 3600
         logger.warning(f"  ! {name}: feed returns only {len(feed.entries)} items, covering {hours:.1f} h of the window")
 
+    # Page checks run newest first and stop once the cap is full, so a capped
+    # feed spends a GET only on items it could actually use.
     cap = int(source.get("max_items") or 0)
+    if source.get("check_access") or any(_host_in(_host(a.link), ACCESS_CHECK_HOSTS) for a in articles):
+        articles.sort(key=lambda a: a.published, reverse=True)
+        free: list[Article] = []
+        for a in articles:
+            if cap and len(free) >= cap:
+                free.append(a)  # over the cap anyway; counted as capped below
+                continue
+            if (source.get("check_access") or _host_in(_host(a.link), ACCESS_CHECK_HOSTS)) and not page_is_free(a.link):
+                status.paid_skipped += 1
+                continue
+            free.append(a)
+        articles = free
     if cap and len(articles) > cap:
         articles.sort(key=lambda a: a.published, reverse=True)
         status.capped = len(articles) - cap
@@ -294,7 +364,8 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article
     status.articles = len(articles)
     status.seconds = round(time.monotonic() - t0, 1)
     capped = f" (capped, {status.capped} more dropped)" if status.capped else ""
-    logger.info(f"  ✓ {name}: {len(articles)} articles in window{capped}")
+    paid = f" ({status.paid_skipped} paywalled left out)" if status.paid_skipped else ""
+    logger.info(f"  ✓ {name}: {len(articles)} articles in window{capped}{paid}")
     return articles, status
 
 

@@ -161,6 +161,70 @@ class FetchTests(unittest.TestCase):
             r = fetch.fetch_all_with_status(28)
         self.assertEqual((len(r.articles), r.hours_back), (1, 28))
 
+    def _feed(self, items, generator=""):
+        """items: (title, link, content_html, source_href)"""
+        d = self.now.strftime("%a, %d %b %Y %H:%M:%S +0000")
+        gen = f"<generator>{generator}</generator>" if generator else ""
+        body = "".join(
+            f"<item><title>{t}</title><link>{link}</link><pubDate>{d}</pubDate>"
+            f"<description>A real subtitle that is long enough to count as a summary.</description>"
+            + (f"<content:encoded><![CDATA[{c}]]></content:encoded>" if c else "")
+            + (f'<source url="{src}">Outlet</source>' if src else "") + "</item>"
+            for t, link, c, src in items)
+        return (f'<?xml version="1.0"?><rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">'
+                f"<channel><title>F</title>{gen}{body}</channel></rss>").encode()
+
+    def test_substack_paid_posts_skipped_only_on_substack(self):
+        paid = '<p>Preview text.</p><p><a href="https://x.substack.com/p/paid">Read more</a></p>'
+        free = "<p>" + "Whole essay. " * 30 + "</p>"
+        items = [("Paid", "https://x.substack.com/p/paid", paid, ""), ("Free", "https://x.substack.com/p/free", free, "")]
+        arts, st = self.fetch_with(self._feed(items, generator="Substack"))
+        self.assertEqual(([a.title for a in arts], st.paid_skipped), (["Free"], 1))
+        arts, st = self.fetch_with(self._feed(items))  # a WordPress feed ending in "Read more" is left alone
+        self.assertEqual((len(arts), st.paid_skipped), (2, 0))
+
+    def test_paywalled_outlets_skipped(self):
+        items = [("Econ", "https://www.economist.com/x", "", ""), ("OK", "https://ok.org/x", "", ""),
+                 ("Via GN", "https://news.google.com/rss/articles/abc", "", "https://www.netdenjd.com")]
+        arts, st = self.fetch_with(self._feed(items))
+        self.assertEqual(([a.title for a in arts], st.paid_skipped), (["OK"], 2))
+
+    def test_own_homepage_stubs_skipped(self):
+        src = {**self.src, "url": "https://hamel.dev/index.xml"}
+        items = [("Stub", "https://hamel.dev/", "", ""), ("Post", "https://hamel.dev/blog/evals", "", ""),
+                 ("HN project home", "https://ollaya.dev/", "", "")]
+        arts, _ = self.fetch_with(self._feed(items), src=src)
+        self.assertEqual([a.title for a in arts], ["Post", "HN project home"])
+
+    def test_page_checks_fail_closed_and_respect_the_cap(self):
+        items = [(f"n{i}", f"https://note.com/u/n/n{i}", "", "") for i in range(4)] + [("other", "https://ok.org/x", "", "")]
+        verdict = {"https://note.com/u/n/n0": True, "https://note.com/u/n/n1": False, "https://note.com/u/n/n2": True}
+        checked = []
+        def page_is_free(url):
+            checked.append(url)
+            if url not in verdict:
+                return False  # unreachable -> fail closed
+            return verdict[url]
+        with mock.patch.object(fetch, "page_is_free", page_is_free):
+            arts, st = self.fetch_with(self._feed(items))
+            self.assertEqual(sorted(a.title for a in arts), ["n0", "n2", "other"])
+            self.assertEqual(st.paid_skipped, 2)  # n1 paid, n3 unreachable
+            checked.clear()
+            arts, st = self.fetch_with(self._feed(items), src={**self.src, "max_items": 1, "check_access": True})
+            self.assertEqual(len(arts), 1)
+            self.assertLessEqual(len(checked), 3)  # stops once the cap is full
+
+    def test_page_is_free_reads_json_ld(self):
+        page = lambda text, code=200: SimpleNamespace(status_code=code, text=text)
+        with mock.patch.object(fetch.httpx, "get", return_value=page('{"isAccessibleForFree":false}')):
+            self.assertFalse(fetch.page_is_free("https://note.com/a/n/n1"))
+        with mock.patch.object(fetch.httpx, "get", return_value=page('{"isAccessibleForFree":true}')):
+            self.assertTrue(fetch.page_is_free("https://note.com/a/n/n1"))
+        with mock.patch.object(fetch.httpx, "get", return_value=page("", 403)):
+            self.assertFalse(fetch.page_is_free("https://note.com/a/n/n1"))
+        with mock.patch.object(fetch.httpx, "get", side_effect=httpx.ConnectTimeout("t")):
+            self.assertFalse(fetch.page_is_free("https://note.com/a/n/n1"))
+
     def test_pubmed_links_lose_per_fetch_params(self):
         self.assertEqual(fetch.canonical_link("https://pubmed.ncbi.nlm.nih.gov/41000001/?utm_source=x&ff=20260926&v=2.18"),
                          "https://pubmed.ncbi.nlm.nih.gov/41000001/")

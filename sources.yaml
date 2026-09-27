@@ -57,12 +57,6 @@ sources:
     weight: 0.8
     last_reviewed: "2026-09-26"
 
-  - name: "Japan Times"
-    url: "https://www.japantimes.co.jp/feed/"
-    max_items: 3
-    category: japan
-    weight: 0.7
-    last_reviewed: "2026-09-26"
 
   - name: "Willamette Week"
     url: "https://www.wweek.com/arc/outboundfeeds/rss/?outputType=xml"
@@ -85,6 +79,7 @@ sources:
 
   - name: "Nature (journal)"
     url: "https://www.nature.com/nature.rss"
+    check_access: true   # page JSON-LD: research papers are mostly paywalled
     window_hours: 48
     max_items: 3
     category: science
@@ -121,11 +116,6 @@ sources:
     weight: 1.4
     last_reviewed: 2026-09-26
 
-  - name: "The Kaitchup (Benjamin Marie)"
-    url: "https://kaitchup.substack.com/feed"
-    category: ai
-    weight: 1.2
-    last_reviewed: 2026-09-26
 
   - name: "METR"
     # REQUIRES FEED_MAX_BYTES >= 25 MB first (feed is ~9 MB). Leave uncapped:
@@ -180,20 +170,7 @@ sources:
     weight: 1.2
     last_reviewed: 2026-09-26
 
-  - name: "Theory, Culture & Society"
-    url: "https://journals.sagepub.com/action/showFeed?ui=0&mi=ehikzz&ai=2b4&jc=tcsa&type=etoc&feed=rss"
-    stale_days: 120   # publishes in issues / rarely; don't judge by gaps
-    category: philosophy
-    weight: 1.0
-    max_items: 3          # flood guard only
-    last_reviewed: 2026-09-26
 
-  - name: "Deleuze and Guattari Studies"
-    url: "https://www.euppublishing.com/action/showFeed?type=etoc&feed=rss&jc=dlgs"
-    stale_days: 150   # publishes in issues / rarely; don't judge by gaps
-    category: philosophy
-    weight: 1.0            # whole issue shares one timestamp: never cap
-    last_reviewed: 2026-09-26
 
   - name: "The Pinocchio Theory (Steven Shaviro)"
     url: "http://www.shaviro.com/Blog/?feed=rss2"   # https refuses connections from EVO
@@ -201,11 +178,6 @@ sources:
     weight: 0.9
     last_reviewed: 2026-09-26
 
-  - name: "千葉雅也（note）"
-    url: "https://note.com/masayachiba/rss"
-    category: philosophy
-    weight: 1.0
-    last_reviewed: 2026-09-26
 
   - name: "山形浩生「経済のトリセツ」"
     url: "https://cruel.hatenablog.com/feed"
@@ -360,6 +332,255 @@ sources:
     url: "https://sakana.ai/feed.xml"
     category: ai
     weight: 0.7
+    last_reviewed: 2026-09-26
+
+  # ─── People (endorsement graph, 2026-09-26) ─────────────────────────
+  # Every feed: HTTP 200 on EVO-X2, 2+ recent posts checked with no paid markers.
+  # Substack feeds depend on the paid-item filter (item_filter rule A).
+
+  # Local AI / inference / hardware (Hivemaker)
+  - name: "Tim Dettmers"
+    url: "https://timdettmers.com/feed/"
+    category: ai
+    weight: 1.3
+    stale_days: 270   # a few long essays a year; Jan→Sep 2026 gap was ~8 months
+    last_reviewed: 2026-09-26
+
+  - name: "Chips and Cheese"
+    url: "https://chipsandcheese.com/feed"   # summary is ~39 chars; fetch.py falls back to content:encoded
+    category: tech
+    weight: 0.8
+    last_reviewed: 2026-09-26
+
+  - name: "Aleksa Gordić"
+    url: "https://www.aleksagordic.com/feed.xml"   # summary-only feed: the picker sees titles
+    category: ai
+    weight: 0.7
+    stale_days: 240
+    last_reviewed: 2026-09-26
+
+  - name: "Hamel Husain (with Shreya Shankar)"
+    url: "https://hamel.dev/index.xml"   # ~550 KB; 7 of 20 items reuse link https://hamel.dev/
+    category: ai
+    weight: 0.9       # sells a Maven evals course
+    max_items: 1
+    stale_days: 120
+    last_reviewed: 2026-09-26
+
+  # AI agents that do research; agent evaluation (autonomous researcher)
+  - name: "AI as Normal Technology (Narayanan & Kapoor)"
+    url: "https://www.normaltech.ai/feed"
+    category: ai
+    weight: 1.4
+    stale_days: 120
+    last_reviewed: 2026-09-26
+
+  - name: "Planned Obsolescence (Ajeya Cotra)"
+    url: "https://www.planned-obsolescence.org/feed"
+    category: ai
+    weight: 1.1
+    stale_days: 120
+    last_reviewed: 2026-09-26
+
+  - name: "Drew Breunig"
+    url: "https://www.dbreunig.com/feed.xml"
+    category: ai
+    weight: 1.1
+    stale_days: 90
+    last_reviewed: 2026-09-26
+
+  - name: "Daniel Litt"
+    url: "https://www.daniellitt.com/rss.xml"   # ~240-char excerpts only
+    category: ai
+    weight: 1.1
+    stale_days: 240
+    last_reviewed: 2026-09-26
+
+  - name: "Melanie Mitchell (AI: A Guide for Thinking Humans)"
+    url: "https://aiguide.substack.com/feed"
+    category: ai
+    weight: 1.1
+    stale_days: 180
+    last_reviewed: 2026-09-26
+
+  - name: "Rohit Krishnan (Strange Loop Canon)"
+    url: "https://www.strangeloopcanon.com/feed"   # paid tier enabled, 0 paid posts so far
+    category: ai
+    weight: 0.8
+    last_reviewed: 2026-09-26
+
+  # Deleuze and AI; continental philosophy of technology
+  - name: "David M. Berry (Stunlaw)"
+    url: "https://stunlaw.blogspot.com/feeds/posts/default"   # not the Substack mirror
+    category: philosophy
+    weight: 1.4
+    stale_days: 90
+    last_reviewed: 2026-09-26
+
+  - name: "Michael Harris (Silicon Reckoner)"
+    url: "https://siliconreckoner.substack.com/feed"
+    category: philosophy
+    weight: 1.1
+    last_reviewed: 2026-09-26
+
+  - name: "L. M. Sacasas (The Convivial Society)"
+    url: "https://theconvivialsociety.substack.com/feed"   # 2/20 paid stubs; rule A drops them
+    category: philosophy
+    weight: 1.0
+    stale_days: 90
+    last_reviewed: 2026-09-26
+
+  - name: "David Roden"
+    url: "https://davidroden3.substack.com/feed"   # never enemyindustry.net (now spam)
+    category: philosophy
+    weight: 0.7       # about half the posts are his horror fiction
+    max_items: 1
+    last_reviewed: 2026-09-26
+
+  - name: "DIFFRACTIØNS (collective)"
+    url: "https://diffractionscollective.com/feed/"   # a collective, not one person
+    category: philosophy
+    weight: 1.1
+    last_reviewed: 2026-09-26
+
+  # Fitness and health science
+  - name: "Alex Hutchinson (Sweat Science)"
+    url: "https://sweatscience.substack.com/feed"
+    category: health
+    weight: 1.2
+    stale_days: 90
+    last_reviewed: 2026-09-26
+
+  - name: "Dr Paddy Barrett"
+    url: "https://paddybarrett.substack.com/feed"   # 1 paid post in 23; rule A drops it
+    category: health
+    weight: 1.0
+    last_reviewed: 2026-09-26
+
+  - name: "John J. Davis (Running Writings)"
+    url: "https://runningwritings.com/feed"   # WordPress: never apply the Substack "Read more" rule
+    category: health
+    weight: 0.7       # sells plans and a book
+    last_reviewed: 2026-09-26
+
+  # Japan: thinkers and writers
+  - name: "筒井淳也（note）"
+    url: "https://note.com/junya_tsutsui/rss"   # teaser-only RSS; note API check (rule B)
+    category: japan
+    weight: 1.0
+    stale_days: 120
+    last_reviewed: 2026-09-26
+
+  - name: "佐藤竜馬（joisino）"
+    url: "https://joisino.hatenablog.com/feed"
+    category: ai
+    weight: 1.1
+    stale_days: 120
+    last_reviewed: 2026-09-26
+
+  - name: "濱口桂一郎（hamachan ブログ）"
+    url: "http://eulabourlaw.cocolog-nifty.com/blog/index.rdf"
+    category: japan
+    weight: 0.6       # ~10% are pointers to paid print journals
+    max_items: 1      # ~7.5 posts/week
+    last_reviewed: 2026-09-26
+
+  - name: "冬木糸一（基本読書）"
+    url: "https://huyukiitoichi.hatenadiary.jp/feed"
+    category: science
+    weight: 0.6       # Amazon affiliate links; about half are SF reviews
+    last_reviewed: 2026-09-26
+
+  # JDM / export trade / US import rules (Javan, JCF)
+  - name: "Sean Morris (GT-R USA): CA compliance"
+    url: "https://www.gtrusablog.com/feeds/posts/default/-/Topic%3A%20CA%20Compliance"
+    category: cars
+    weight: 0.7
+    max_items: 1
+    last_reviewed: 2026-09-26
+
+  - name: "Sean Morris (GT-R USA): ARB/tariffs"
+    url: "https://www.gtrusablog.com/feeds/posts/default/-/Topic%3A%20ARB"
+    category: cars
+    weight: 0.7
+    max_items: 1
+    last_reviewed: 2026-09-26
+
+  - name: "ジュエルオート 久保（みんカラ）"
+    url: "https://minkara.carview.co.jp/userid/330073/blog/rss.aspx"   # ~150-char teasers
+    category: cars
+    weight: 0.4       # no endorsement; kept for first-hand weekly USS Nagoya reports
+    last_reviewed: 2026-09-26
+
+  # Crisis identification, cybernetics (Kyberna)
+  - name: "Dan Davies (Back of Mind)"
+    url: "https://backofmind.substack.com/feed"
+    category: ideas
+    weight: 1.4
+    last_reviewed: 2026-09-26
+
+  - name: "Sentinel Global Risks Watch (Nuño Sempere)"
+    url: "https://blog.sentinel-team.org/feed"   # 1/23 paid (2026-07-20); rule A drops it
+    category: world
+    weight: 1.0
+    last_reviewed: 2026-09-26
+
+  - name: "Jennifer Pahlka (Eating Policy)"
+    url: "https://www.eatingpolicy.com/feed"
+    category: ideas
+    weight: 1.2
+    last_reviewed: 2026-09-26
+
+  - name: "Ben Recht (arg min)"
+    url: "https://www.argmin.net/feed"
+    category: ideas
+    weight: 1.2
+    last_reviewed: 2026-09-26
+
+  - name: "Adam Kucharski (Understanding the Unseen)"
+    url: "https://kucharski.substack.com/feed"
+    category: health
+    weight: 0.8
+    last_reviewed: 2026-09-26
+
+  # Generalists
+  - name: "Kevin Munger (Never Met a Science)"
+    url: "https://kevinmunger.substack.com/feed"
+    category: ideas
+    weight: 1.0
+    last_reviewed: 2026-09-26
+
+  - name: "Matt Clancy (New Things Under the Sun)"
+    url: "https://mattsclancy.substack.com/feed"   # newthingsunderthesun.com returns 403 from EVO
+    category: ideas
+    weight: 1.1
+    stale_days: 180   # ~5 posts a year
+    last_reviewed: 2026-09-26
+
+  - name: "Dwarkesh Patel"
+    url: "https://www.dwarkesh.com/feed"
+    category: ai
+    weight: 0.8
+    max_items: 1      # full transcripts, ~45k chars each
+    last_reviewed: 2026-09-26
+
+  - name: "Ethan Mollick (One Useful Thing)"
+    url: "https://www.oneusefulthing.org/feed"
+    category: ai
+    weight: 1.0
+    last_reviewed: 2026-09-26
+
+  - name: "Dynomight"
+    url: "https://dynomight.net/feed.xml"
+    category: ideas
+    weight: 1.0
+    last_reviewed: 2026-09-26
+
+  - name: "Andrew Gelman (Statistical Modeling, Causal Inference)"
+    url: "https://statmodeling.stat.columbia.edu/feed/"
+    category: science
+    weight: 0.7
+    max_items: 1      # ~11 posts/week, some by co-bloggers
     last_reviewed: 2026-09-26
 
   # ─── Aggregators: keep LAST — dedupe_links prefers a real summary, then weight, then the first listing ───

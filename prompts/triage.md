@@ -31,7 +31,7 @@ From the articles below, pick the ones most worth Ian's attention this morning. 
 - Partisan US politics without real-world consequence; celebrity, royals, sports; market commentary and crypto speculation; listicles and content marketing.
 - Stories Ian has certainly already seen everywhere (major breaking news is fine; viral noise is not).
 - Bare market ticks (unless the yen moves enough to matter for Javan and JCF — then say how), はてブ togetter threads, manga and anonymous-diary posts.
-- Podcast-only episodes, journal issue announcements and front/back matter, newspaper-ad posts, open threads. A paywalled or title-only item is fine when the headline alone is decision-useful.
+- Podcast-only episodes, journal issue announcements and front/back matter, newspaper-ad posts, open threads. Never pick a paywalled or subscribers-only item — Ian subscribes to nothing; a free item with only a title is fine when the headline alone is decision-useful.
 
 ## Selection rules
 
