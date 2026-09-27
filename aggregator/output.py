@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from aggregator.fetch import SourceStatus
@@ -129,6 +129,18 @@ def write_failure_note(reason: str, run_dir: str | None = None) -> Path | None:
         return None
 
 
+def _age(published: str) -> str:
+    """'5 h ago' / '2 d ago' from an ISO timestamp; '' if unknown."""
+    try:
+        t = datetime.fromisoformat(published)
+    except (TypeError, ValueError):
+        return ""
+    hours = (datetime.now(timezone.utc) - t).total_seconds() / 3600
+    if hours < 0:
+        return ""
+    return f"{hours:.0f} h ago" if hours < 48 else f"{hours / 24:.0f} d ago"
+
+
 def format_brief(
     result: TriageResult,
     date_str: str,
@@ -179,7 +191,9 @@ def format_brief(
         lines.append("")
         for pick in sorted(by_category[category], key=lambda p: -p.interest_score):
             lines.append(f"- [ ] **[{pick.title}]({pick.url})**")
-            lines.append(f"  *{pick.source}* — score {pick.interest_score}/10")
+            meta = [f"*{pick.source}*", _age(pick.published), f"score {pick.interest_score}/10",
+                    "headline only" if pick.headline_only else ""]
+            lines.append("  " + " · ".join(m for m in meta if m))
             if pick.summary:
                 lines.append(f"  > {pick.summary}")
             lines.append("")

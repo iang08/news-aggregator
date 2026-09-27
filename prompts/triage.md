@@ -42,8 +42,7 @@ Return ONLY valid JSON, no preamble or commentary. The structure:
       "category": "Category from input: ai, tech, world, japan, local, science, health, philosophy, cars, ideas",
       "url": "Article URL",
       "summary": "1-2 sentences. WHY this matters specifically. Skip generic descriptions.",
-      "interest_score": 1-10,
-      "tags": ["short", "tags", "for", "Obsidian"]
+      "interest_score": 1-10
     }
   ]
 }
@@ -55,7 +54,6 @@ Return ONLY valid JSON, no preamble or commentary. The structure:
 - Diversify across categories when quality is comparable, but don't force diversity at the cost of signal.
 - A weight=2.0 source (Simon Willison) posting something he chose to write is almost always worth including. A weight=0.8 source needs to clear a higher bar.
 - The summary should answer "why does Ian care about this?" — not just describe the article.
-- Tags should be useful for Obsidian linking later (e.g., "local-llm", "japan-economy", "agentic-systems"), not generic ("news", "tech").
 
 ## Tone
 

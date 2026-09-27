@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import time
 from dataclasses import dataclass, field, replace
@@ -102,11 +103,10 @@ TRIAGE_SCHEMA = {
                     "url": {"type": "string"},
                     "summary": {"type": "string"},
                     "interest_score": {"type": "integer"},
-                    "tags": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": [
                     "title", "source", "category", "url",
-                    "summary", "interest_score", "tags",
+                    "summary", "interest_score",
                 ],
                 "additionalProperties": False,
             },
@@ -282,7 +282,9 @@ class TriagePick:
     url: str
     summary: str
     interest_score: int
-    tags: list[str] = field(default_factory=list)
+    # From the input article (set by resolve_picks), shown in the brief:
+    published: str = ""          # ISO time the article was published
+    headline_only: bool = False  # the model had no summary to judge from
 
 
 @dataclass
@@ -650,6 +652,11 @@ def _norm_url(u: str) -> str:
     return host + unquote(parts.path).rstrip("/") + ("?" + urlencode(query) if query else "")
 
 
+# A summary shorter than this tells the model nothing beyond the title; the
+# brief marks such picks so Ian knows the choice rested on the headline.
+HEADLINE_ONLY_CHARS = 40
+
+
 def _norm_title(t: str) -> str:
     return re.sub(r"\s+", " ", t or "").strip().casefold()
 
@@ -677,7 +684,10 @@ def resolve_picks(picks: list[TriagePick], articles: list[Article]) -> tuple[lis
         if a is None:
             unmatched.append(p)
         else:
-            resolved.append(replace(p, url=a.link, title=a.title, source=a.source_name))
+            resolved.append(replace(
+                p, url=a.link, title=a.title, source=a.source_name,
+                published=a.published.isoformat(), headline_only=len(a.summary) < HEADLINE_ONLY_CHARS,
+            ))
     return resolved, unmatched
 
 
@@ -736,6 +746,11 @@ def triage(articles: list[Article]) -> TriageResult:
     if not articles:
         raise ValueError("All fetched articles were already featured recently — nothing new to triage")
 
+    # Shuffle the order, seeded by the date: feeds are listed by interest lane,
+    # and a model reading ~50-200 items favors some positions. A daily seed
+    # spreads that across sources and stays reproducible (user_msg is saved).
+    articles = list(articles)
+    random.Random(today).shuffle(articles)
     article_block = format_articles_for_claude(articles)
     recent_block = ""
     if recent_picks:
@@ -750,8 +765,8 @@ def triage(articles: list[Article]) -> TriageResult:
     logger.info(f"Sending {len(articles)} articles to Claude ({model}) for triage...")
 
     user_msg = (
-        f"Here are {len(articles)} recent articles (most from the last 24 hours; "
-        f"journal and arXiv feeds reach back up to 4 days). "
+        f"Here are {len(articles)} recent articles (published since about the last brief; "
+        f"journal and arXiv feeds reach back up to 4 days), in no particular order. "
         f"Triage them per the instructions in your system prompt."
         f"{recent_block}\n\n"
         f"{article_block}"
@@ -823,7 +838,6 @@ def triage(articles: list[Article]) -> TriageResult:
             url=p["url"],
             summary=p["summary"],
             interest_score=int(p["interest_score"]),
-            tags=p.get("tags", []),
         )
         for p in parsed.get("picks", [])
     ]
@@ -876,6 +890,5 @@ if __name__ == "__main__":
         print(f"{i}. [{pick.category}] {pick.source} (score: {pick.interest_score}/10)")
         print(f"   {pick.title}")
         print(f"   {pick.summary}")
-        print(f"   Tags: {', '.join(pick.tags)}")
         print(f"   {pick.url}")
         print()

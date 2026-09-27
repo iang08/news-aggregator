@@ -98,6 +98,8 @@ class SourceStatus:
 class FetchResult:
     articles: list[Article]
     sources: list[SourceStatus] = field(default_factory=list)
+    duplicates_dropped: int = 0  # same link from more than one feed
+    hours_back: float = 24
 
     @property
     def failed(self) -> list[SourceStatus]:
@@ -296,7 +298,21 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article
     return articles, status
 
 
-def fetch_all_with_status(hours_back: int = 24) -> FetchResult:
+def dedupe_links(articles: list[Article]) -> tuple[list[Article], int]:
+    """Keep the first article per link (sources.yaml order): the same story
+    linked from HN and a subreddit, or re-listed by an aggregator, would
+    otherwise compete with itself for slots."""
+    seen: set[str] = set()
+    kept = []
+    for a in articles:
+        if a.link and a.link in seen:
+            continue
+        seen.add(a.link)
+        kept.append(a)
+    return kept, len(articles) - len(kept)
+
+
+def fetch_all_with_status(hours_back: float = 24) -> FetchResult:
     """Fetch all sources; return the combined articles plus per-source status.
 
     Retries the entire fetch if ALL sources returned zero articles, which is
@@ -306,9 +322,10 @@ def fetch_all_with_status(hours_back: int = 24) -> FetchResult:
     sources = load_sources()
 
     def one(source: dict[str, Any]) -> tuple[list[Article], SourceStatus]:
-        # A per-source window_hours overrides the run's: journals and arXiv
-        # stamp entries hours or days before they actually appear.
-        hours = source.get("window_hours") or hours_back
+        # A per-source window_hours reaches further back than the run's own
+        # window: journals and arXiv stamp entries hours or days before they
+        # actually appear. It never shortens the run's window.
+        hours = max(source.get("window_hours") or 0, hours_back)
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         try:
             return fetch_source(source, cutoff)
@@ -334,7 +351,10 @@ def fetch_all_with_status(hours_back: int = 24) -> FetchResult:
         )
 
         if all_articles:
-            return FetchResult(all_articles, statuses)
+            all_articles, dupes = dedupe_links(all_articles)
+            if dupes:
+                logger.info(f"Dropped {dupes} duplicate link(s) listed by more than one feed")
+            return FetchResult(all_articles, statuses, duplicates_dropped=dupes, hours_back=hours_back)
 
         if attempt == MAX_FETCH_ATTEMPTS:
             logger.error(
@@ -342,7 +362,7 @@ def fetch_all_with_status(hours_back: int = 24) -> FetchResult:
                 f"{attempt}/{MAX_FETCH_ATTEMPTS}; giving up. Likely network "
                 f"problem or all feeds genuinely empty."
             )
-            return FetchResult(all_articles, statuses)
+            return FetchResult(all_articles, statuses, hours_back=hours_back)
 
         logger.warning(
             f"All {len(sources)} sources returned 0 articles on attempt "

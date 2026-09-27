@@ -89,7 +89,7 @@ def run_arm(client, model: str, system_prompt: str, user_msg: str, articles: lis
         return {"ok": False, "error": f"{type(e).__name__}: {e}"[:300], "meta": meta}
     picks = [
         TriagePick(title=p["title"], source=p["source"], category=p["category"], url=p["url"],
-                   summary=p["summary"], interest_score=int(p["interest_score"]), tags=p.get("tags", []))
+                   summary=p["summary"], interest_score=int(p["interest_score"]))
         for p in parsed.get("picks", [])
     ]
     picks, unmatched = resolve_picks(picks, articles)  # same as production

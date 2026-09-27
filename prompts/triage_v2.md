@@ -43,7 +43,6 @@ From the articles below, pick the ones most worth Ian's attention this morning. 
 
 - `summary`: 1-2 sentences on why *Ian* should care — name the project or interest it touches and the concrete implication. Don't write "directly relevant"; say how. For a currency, price or market item, say which way it moved and what that means for him (e.g. a weaker yen makes auction buys cheaper in dollars) — using only figures the article gives.
 - `interest_score`, honestly: 9-10 must-read today; 7-8 worth reading; 5-6 marginal; 1-4 not worth his time. Most days have few 9s.
-- `tags`: 1-3 short tags useful for Obsidian links (e.g. "local-llm", "jdm-auctions", "hypertrophy"), never generic ("news").
 - The top-level `summary`: one sentence naming the single most important thing today — not a list of topics.
 
 ## Tone

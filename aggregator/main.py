@@ -17,6 +17,7 @@ Usage:
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 from aggregator.fetch import FetchResult, SourceStatus, fetch_all_with_status
-from aggregator.triage import TriageResult, load_env, triage, triage_model
+from aggregator.triage import TriageResult, _history_dirs, load_env, triage, triage_model
 from aggregator.output import existing_brief, write_brief, write_failure_note
 
 # A feed that failed this many runs in a row is "dead" and flagged in the
@@ -38,6 +39,32 @@ DEAD_AFTER_RUNS = 3
 MANY_DOWN_SHARE = 0.25
 # This many picks naming no input article (invented URLs) is worth a banner.
 MANY_UNMATCHED = 3
+# Fetch window: since the last brief (+30 min), at least 28 h so consecutive
+# 07:00 runs overlap a little (cross-day dedup removes repeats), at most 48 h.
+# A fixed 24 h lost ~15 h of news after the late 2026-09-25 run.
+WINDOW_MIN_H = 28
+WINDOW_MAX_H = 48
+
+
+def fetch_window_hours(now: datetime) -> tuple[float, float | None]:
+    """(hours to look back, hours since the last brief or None). The last brief
+    is the newest earlier-dated *-brief.md in the history dirs; its mtime is
+    when it was written (delivery moves it without touching the mtime)."""
+    today = now.strftime("%Y-%m-%d")
+    newest = None
+    for d in _history_dirs():
+        for path in glob.glob(os.path.join(d, "*-brief.md")):
+            if os.path.basename(path).startswith(today):
+                continue  # a same-day re-run: look back from the day before
+            try:
+                m = os.path.getmtime(path)
+            except OSError:
+                continue
+            newest = m if newest is None else max(newest, m)
+    if newest is None:
+        return float(WINDOW_MIN_H), None
+    since = (now.timestamp() - newest) / 3600
+    return min(WINDOW_MAX_H, max(WINDOW_MIN_H, since + 0.5)), since
 
 
 def setup_logging() -> None:
@@ -134,6 +161,8 @@ def save_run_record(
             "notices": notices,
             "brief_path": str(brief_path) if brief_path else None,
             "fetched": len(fetch.articles) if fetch else 0,
+            "hours_back": fetch.hours_back if fetch else None,
+            "duplicates_dropped": fetch.duplicates_dropped if fetch else 0,
             "sources": [asdict(s) for s in fetch.sources] if fetch else [],
         }
         if result is not None:
@@ -187,7 +216,9 @@ def run() -> tuple[int, str, str]:
         triage_model()
 
         # Step 1: Fetch articles from RSS feeds
-        fetch = fetch_all_with_status()
+        hours, since = fetch_window_hours(started)
+        logger.info(f"Fetch window: {hours:.1f} h" + (f" (last brief {since:.1f} h ago)" if since is not None else " (no earlier brief found)"))
+        fetch = fetch_all_with_status(hours)
         if not fetch.articles:
             raise RuntimeError(
                 f"all {len(fetch.sources)} feeds returned 0 articles "
