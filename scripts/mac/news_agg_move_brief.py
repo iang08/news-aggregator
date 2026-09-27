@@ -89,8 +89,10 @@ def awake_since(now: datetime) -> datetime:
     last_pass_f = os.path.join(STATE, "last-pass")
     awake_f = os.path.join(STATE, "awake-since")
     try:
-        last = datetime.fromtimestamp(float(open(last_pass_f).read()), now.tzinfo)
-        since = datetime.fromtimestamp(float(open(awake_f).read()), now.tzinfo)
+        with open(last_pass_f) as f:
+            last = datetime.fromtimestamp(float(f.read()), now.tzinfo)
+        with open(awake_f) as f:
+            since = datetime.fromtimestamp(float(f.read()), now.tzinfo)
     except (OSError, ValueError):
         last = since = None
     if last is None or since is None or now - last > SLEEP_GAP:

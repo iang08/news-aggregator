@@ -11,7 +11,7 @@ arms against the within-arm (rep-vs-rep) overlap, on at least 3 pools.
 Dry run by default (prints the plan and a cost estimate); --apply calls the API.
 
     python -m aggregator.replay --runs ~/news_agg_out/runs/2026-09-2* \\
-        --prompt prompts/triage.md --prompt prompts/triage_v2.md --reps 3 \\
+        --prompt prompts/triage_v1.md --prompt prompts/triage.md --reps 3 \\
         --out ~/news_agg_audit/replay/v2 [--model claude-sonnet-4-6] [--apply]
 """
 

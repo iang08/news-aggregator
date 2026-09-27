@@ -129,16 +129,22 @@ def write_failure_note(reason: str, run_dir: str | None = None) -> Path | None:
         return None
 
 
-def _age(published: str) -> str:
-    """'5 h ago' / '2 d ago' from an ISO timestamp; '' if unknown."""
+# The first picks get read: the click check found pick 1 opened 52% of the
+# time and picks 7-10 under 12%. So the best picks go first, in their own
+# section, whatever their category.
+TOP_MIN_SCORE = 9
+TOP_MAX = 3
+
+
+def _when(published: str) -> str:
+    """Local publish time, e.g. 'Sat 06:40' — fixed, unlike 'N h ago', which
+    was wrong by the time Ian read the brief. A time exactly on the hour is
+    usually a date-only feed (Nature, PubMed): show the date."""
     try:
-        t = datetime.fromisoformat(published)
+        t = datetime.fromisoformat(published).astimezone()
     except (TypeError, ValueError):
         return ""
-    hours = (datetime.now(timezone.utc) - t).total_seconds() / 3600
-    if hours < 0:
-        return ""
-    return f"{hours:.0f} h ago" if hours < 48 else f"{hours / 24:.0f} d ago"
+    return t.strftime("%a %-d %b") if (t.minute, t.second) == (0, 0) else t.strftime("%a %H:%M")
 
 
 def format_brief(
@@ -176,22 +182,27 @@ def format_brief(
         "",
     ]
 
-    # Group picks by category for readability
-    by_category: dict[str, list] = {}
-    for pick in result.picks:
-        by_category.setdefault(pick.category, []).append(pick)
+    ranked = sorted(result.picks, key=lambda p: -p.interest_score)
+    top = [p for p in ranked if p.interest_score >= TOP_MIN_SCORE][:TOP_MAX]
+    rest = [p for p in ranked if p not in top]
 
+    # Group the rest by category for readability
+    by_category: dict[str, list] = {}
+    for pick in rest:
+        by_category.setdefault(pick.category, []).append(pick)
+    
     sorted_categories = sorted(
         by_category.keys(),
         key=lambda c: CATEGORY_ORDER.index(c) if c in CATEGORY_ORDER else 99
     )
-
-    for category in sorted_categories:
-        lines.append(f"## {category.upper()}")
+    
+    sections = ([("★ TOP", top)] if top else []) + [(c.upper(), by_category[c]) for c in sorted_categories]
+    for heading, picks in sections:
+        lines.append(f"## {heading}")
         lines.append("")
-        for pick in sorted(by_category[category], key=lambda p: -p.interest_score):
+        for pick in picks:
             lines.append(f"- [ ] **[{pick.title}]({pick.url})**")
-            meta = [f"*{pick.source}*", _age(pick.published), f"score {pick.interest_score}/10",
+            meta = [f"*{pick.source}*", _when(pick.published), f"score {pick.interest_score}/10",
                     "headline only" if pick.headline_only else ""]
             lines.append("  " + " · ".join(m for m in meta if m))
             if pick.summary:

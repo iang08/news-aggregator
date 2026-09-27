@@ -26,19 +26,33 @@ fi
 # lock every catch-up needs. fetch.py and triage.py have their own per-call
 # limits; this is the backstop for whatever slips past them.
 RUN_LIMIT=45m
+RUN_LIMIT_S=2700
 today=$(date '+%F')
+t0=$(date +%s)
 timeout --kill-after=60 "$RUN_LIMIT" env PYTHONPATH=. NEWS_AGG_HEARTBEAT=1 .venv/bin/python -m aggregator.main
 rc=$?
+elapsed=$(( $(date +%s) - t0 ))
 
 # A killed or crashed run can't report itself (main.py writes the failure note
 # and the heartbeat on its own failures), so do it here: the failure must reach
 # the inbox, not only this log. rc 3 = today's brief already existed.
+# Only a note or brief written by THIS run counts: a catch-up must not take the
+# 07:00 run's delivered failure note as its own report (mv keeps the mtime).
 out="$HOME/news_agg_out"
-reported() { for d in "$out/00-Inbox" "$out/delivered"; do
-    [ -e "$d/$today-brief.md" ] || [ -e "$d/$today-brief-FAILED.md" ] && return 0; done; return 1; }
-if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ] && { [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || ! reported; }; then
-    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+reported() { local f; for f in "$out"/{00-Inbox,delivered}/"$today"-brief{,-FAILED}.md; do
+    [ -e "$f" ] && [ "$(stat -c %Y "$f")" -ge "$t0" ] && return 0; done; return 1; }
+# timeout exits 124 when the limit hits and 137 when --kill-after SIGKILLs a run
+# that ignored SIGTERM; a 137 well inside the limit is some other SIGKILL (the
+# kernel's OOM killer), not the limit.
+timed_out=0
+if [ "$rc" -eq 124 ] || { [ "$rc" -eq 137 ] && [ "$elapsed" -ge "$RUN_LIMIT_S" ]; }; then timed_out=1; fi
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ] && { [ "$timed_out" = 1 ] || ! reported; }; then
+    if [ "$timed_out" = 1 ]; then
         reason="the run was killed after $RUN_LIMIT (a hung feed or model call)"
+    elif [ "$rc" -eq 137 ]; then
+        reason="aggregator.main was SIGKILLed after ${elapsed}s, not by the $RUN_LIMIT limit (the kernel OOM killer? see journalctl -k)"
+    elif [ "$rc" -gt 128 ]; then
+        reason="aggregator.main died on signal $((rc - 128)) after ${elapsed}s (see cron.log)"
     else
         reason="aggregator.main exited $rc without reporting (see cron.log)"
     fi

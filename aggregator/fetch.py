@@ -162,7 +162,7 @@ def load_sources(path: Path = Path("sources.yaml")) -> list[dict[str, Any]]:
         # Set defaults for optional fields
         src.setdefault("weight", 1.0)
         src.setdefault("max_items", 0)  # 0 = no per-run cap
-        src.setdefault("window_hours", 0)  # 0 = the run's window (24 h)
+        src.setdefault("window_hours", 0)  # 0 = the run's window (28-48 h, main.fetch_window_hours)
 
     return sources
 
@@ -298,17 +298,34 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article
     return articles, status
 
 
+# hnrss and Reddit link posts carry only metadata in the summary ("Article URL:
+# ... Points: 452", "submitted by /u/x [link] [comments]"), nothing about the story.
+_FEED_BOILERPLATE_RE = re.compile(
+    r"Article URL: \S+|Comments URL: \S+|Points: \d+|# Comments: \d+|submitted by /u/\S+|\[link\]|\[comments\]")
+# A summary with less content than this tells the model nothing beyond the title.
+HEADLINE_ONLY_CHARS = 40
+
+
+def is_headline_only(summary: str) -> bool:
+    return len(_FEED_BOILERPLATE_RE.sub("", summary or "").strip()) < HEADLINE_ONLY_CHARS
+
+
 def dedupe_links(articles: list[Article]) -> tuple[list[Article], int]:
-    """Keep the first article per link (sources.yaml order): the same story
-    linked from HN and a subreddit, or re-listed by an aggregator, would
-    otherwise compete with itself for slots."""
-    seen: set[str] = set()
-    kept = []
+    """One article per link: the same story linked from HN and a subreddit, or
+    re-listed by an aggregator, would otherwise compete with itself for slots.
+    Keeps the best-informed copy (a real summary beats HN/Reddit metadata, then
+    the higher weight; ties keep the first in sources.yaml order)."""
+    kept: list[Article] = []
+    where: dict[str, int] = {}
+    better = lambda a: (not is_headline_only(a.summary), a.source_weight)
     for a in articles:
-        if a.link and a.link in seen:
-            continue
-        seen.add(a.link)
-        kept.append(a)
+        i = where.get(a.link) if a.link else None
+        if i is None:
+            if a.link:
+                where[a.link] = len(kept)
+            kept.append(a)
+        elif better(a) > better(kept[i]):
+            kept[i] = a
     return kept, len(articles) - len(kept)
 
 
@@ -325,7 +342,9 @@ def fetch_all_with_status(hours_back: float = 24) -> FetchResult:
         # A per-source window_hours reaches further back than the run's own
         # window: journals and arXiv stamp entries hours or days before they
         # actually appear. It never shortens the run's window.
-        hours = max(source.get("window_hours") or 0, hours_back)
+        # window_hours is the feed's window on a normal 24 h day; the extra reach is
+        # added to the run's window, so it survives a late or missed run.
+        hours = hours_back + max(0, (source.get("window_hours") or 0) - 24)
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         try:
             return fetch_source(source, cutoff)

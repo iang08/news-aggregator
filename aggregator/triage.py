@@ -26,7 +26,7 @@ import httpx
 from anthropic import Anthropic
 from dotenv import dotenv_values, load_dotenv
 
-from aggregator.fetch import Article
+from aggregator.fetch import Article, is_headline_only
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,10 @@ MAX_TOKENS = 16000
 # slots whatever the day (87/99 briefs had exactly 12, 15% of picks scored <= 6),
 # and Sonnet 5 returned 14, so the cap lives in code, not in the prompt.
 MAX_PICKS = 12
+# Picks scored below this are dropped. Click check 2026-09-26 (1,077 picks):
+# opened 38% at score 9, 19% at 7, 12% at 6, 0% at 5 — the scores are
+# calibrated, and a 5 is noise. (The model is not told about this cut.)
+MIN_SCORE = 6
 
 # Structured-output schema for the triage response. Passed as
 # output_config.format so the API CONSTRAINS the model to emit valid,
@@ -180,7 +184,7 @@ LOCAL_MAX_CTX = 65536
 LOCAL_MIN_AVAIL_GB = 30
 
 # Cross-day dedup. The brief is otherwise stateless — each run re-triages the
-# last 24h with no memory of what it featured before, so major multi-day
+# run's fetch window with no memory of what it featured before, so major multi-day
 # stories (and any window overlap) resurface. We give triage memory by reading
 # the recent brief files it already keeps: hard-exclude any article URL already
 # featured (deterministic), and tell the model which topics were just covered
@@ -190,7 +194,9 @@ LOCAL_MIN_AVAIL_GB = 30
 # brief output dir. On EVO-X2 set it to include the delivered/ dir, since
 # deliver.sh moves shipped briefs out of the output dir.
 BRIEF_HISTORY_DAYS = 5
-_PICK_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+# Link text may hold one level of brackets — "[audio.cpp] ...", "Title [pdf]":
+# a plain [^\]]+ skipped those picks, so they were re-offered the next day.
+_PICK_LINK_RE = re.compile(r"\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\((https?://[^)\s]+)\)")
 _BRIEF_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})-brief\.md$")
 
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
@@ -652,11 +658,6 @@ def _norm_url(u: str) -> str:
     return host + unquote(parts.path).rstrip("/") + ("?" + urlencode(query) if query else "")
 
 
-# A summary shorter than this tells the model nothing beyond the title; the
-# brief marks such picks so Ian knows the choice rested on the headline.
-HEADLINE_ONLY_CHARS = 40
-
-
 def _norm_title(t: str) -> str:
     return re.sub(r"\s+", " ", t or "").strip().casefold()
 
@@ -686,18 +687,19 @@ def resolve_picks(picks: list[TriagePick], articles: list[Article]) -> tuple[lis
         else:
             resolved.append(replace(
                 p, url=a.link, title=a.title, source=a.source_name,
-                published=a.published.isoformat(), headline_only=len(a.summary) < HEADLINE_ONLY_CHARS,
+                published=a.published.isoformat(), headline_only=is_headline_only(a.summary),
             ))
     return resolved, unmatched
 
 
 def finalize_picks(picks: list[TriagePick]) -> tuple[list[TriagePick], list[TriagePick]]:
-    """Best first, one entry per URL, at most MAX_PICKS. Returns (kept, dropped)."""
+    """Best first, one entry per URL, score >= MIN_SCORE, at most MAX_PICKS.
+    Returns (kept, dropped)."""
     seen: set[str] = set()
     kept: list[TriagePick] = []
     dropped: list[TriagePick] = []
     for p in sorted(picks, key=lambda p: -p.interest_score):  # stable: ties keep model order
-        if p.url in seen or len(kept) >= MAX_PICKS:
+        if p.url in seen or len(kept) >= MAX_PICKS or p.interest_score < MIN_SCORE:
             dropped.append(p)
         else:
             seen.add(p.url)
@@ -814,7 +816,11 @@ def triage(articles: list[Article]) -> TriageResult:
         reason = f"{type(claude_err).__name__}: {claude_err}"[:180]
         fallback_reason = f"{fallback_reason}; then {reason}" if fallback_reason else reason
         if not fallback_enabled:
-            raise
+            # Say so in the failure note: the catch-up disables the local model
+            # when the box is short of memory.
+            raise RuntimeError(
+                f"Claude failed ({fallback_reason}); local fallback disabled (TRIAGE_LOCAL_FALLBACK=0)"
+            ) from claude_err
         logger.error(
             f"Claude triage failed ({fallback_reason}). "
             f"Falling back to the local model so the brief still ships."

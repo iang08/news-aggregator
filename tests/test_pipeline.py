@@ -135,6 +135,24 @@ class FetchTests(unittest.TestCase):
         kept, n = fetch.dedupe_links([a("HN", "https://x/1"), a("Reddit", "https://x/1"), a("HN", "https://x/2")])
         self.assertEqual(([x.source_name for x in kept], n), (["HN", "HN"], 1))
 
+    def test_duplicate_link_keeps_the_informative_copy(self):
+        # Live 2026-09-26: HN (listed before Quanta, weight 1.0) carries only metadata.
+        link = "https://www.quantamagazine.org/gravity-seems-holographic/"
+        hn = Article("Gravity", link, f"Article URL: {link} Comments URL: https://news.ycombinator.com/item?id=1 "
+                     "Points: 452 # Comments: 185", self.now, "Hacker News (200+ pts)", "ai", 1.0)
+        qm = Article("Gravity", link, "The biggest breakthrough in modern theoretical physics is ...",
+                     self.now, "Quanta Magazine", "science", 1.5)
+        kept, n = fetch.dedupe_links([hn, qm])
+        self.assertEqual(([(x.source_name, x.source_category) for x in kept], n), ([("Quanta Magazine", "science")], 1))
+
+    def test_fetch_all_drops_cross_feed_duplicates(self):
+        b = {**self.src, "name": "Other", "url": "https://f/other"}
+        body = rss([("t", "https://a/1", self.now - timedelta(hours=1), "s")])
+        with mock.patch.object(fetch, "load_sources", return_value=[self.src, b]), \
+                mock.patch.object(fetch, "_download", lambda url: (200, {}, url, body)):
+            r = fetch.fetch_all_with_status(28)
+        self.assertEqual((len(r.articles), r.duplicates_dropped), (1, 1))
+
     def test_feed_window_never_shortens_run_window(self):
         src = {**self.src, "window_hours": 12}
         two_h = self.now - timedelta(hours=20)
@@ -258,13 +276,19 @@ class ModelParamTests(EnvTestCase):
 
 class PickTests(unittest.TestCase):
     def test_sort_dedupe_cap(self):
-        picks = [pick(url=f"https://x/{i}", score=i % 10) for i in range(16)]
-        picks.append(pick(url="https://x/9", score=9))  # duplicate URL
+        picks = [pick(url=f"https://x/{i}", score=6 + i % 4) for i in range(16)]
+        picks.append(pick(url="https://x/3", score=9))   # duplicate URL
+        picks.append(pick(url="https://x/low", score=5))  # below MIN_SCORE
         kept, dropped = triage.finalize_picks(picks)
         self.assertEqual(len(kept), triage.MAX_PICKS)
         self.assertEqual(len({p.url for p in kept}), len(kept))
         self.assertEqual([p.interest_score for p in kept], sorted((p.interest_score for p in kept), reverse=True))
-        self.assertEqual(len(kept) + len(dropped), 17)
+        self.assertEqual(len(kept) + len(dropped), 18)
+        self.assertIn("https://x/low", [p.url for p in dropped])
+
+    def test_score_floor_keeps_a_short_list_short(self):
+        kept, dropped = triage.finalize_picks([pick(url="https://a/1", score=8), pick(url="https://a/2", score=5)])
+        self.assertEqual(([p.url for p in kept], [p.url for p in dropped]), (["https://a/1"], ["https://a/2"]))
 
 
 class ResolveTests(unittest.TestCase):
@@ -306,15 +330,40 @@ class ResolveEdgeTests(unittest.TestCase):
 
 class PickDisplayTests(unittest.TestCase):
     def test_resolve_sets_age_and_headline_only(self):
-        t = datetime.now(timezone.utc) - timedelta(hours=5)
+        t = (datetime.now(timezone.utc) - timedelta(hours=5)).replace(minute=40, second=0, microsecond=0)
         arts = [Article("Title only", "https://a/1", "", t, "S", "ai", 1.0),
                 Article("Has body", "https://a/2", "x" * 200, t, "S", "ai", 1.0)]
         ok, _ = triage.resolve_picks([pick("Title only", "https://a/1"), pick("Has body", "https://a/2")], arts)
         self.assertEqual([p.headline_only for p in ok], [True, False])
         md = output.format_brief(result(ok), "2026-09-27")
-        self.assertIn("*S* · 5 h ago · score 7/10 · headline only", md)
-        self.assertIn("*S* · 5 h ago · score 7/10\n", md)
+        when = t.astimezone().strftime("%a %H:%M")  # a fixed local time, not "5 h ago"
+        self.assertIn(f"*S* · {when} · score 7/10 · headline only", md)
+        self.assertIn(f"*S* · {when} · score 7/10\n", md)
         self.assertNotIn("tags", json.dumps(triage.TRIAGE_SCHEMA))
+
+    def test_hn_and_reddit_link_posts_are_headline_only(self):
+        t = datetime.now(timezone.utc) - timedelta(hours=3)
+        arts = [Article("HN", "https://a/1", "Article URL: https://x/y Comments URL: https://news.ycombinator.com/item?id=1 "
+                        "Points: 452 # Comments: 185", t, "Hacker News (200+ pts)", "ai", 1.0),
+                Article("Reddit", "https://a/2", "submitted by /u/someone [link] [comments]", t, "r/LocalLLaMA", "ai", 1.3)]
+        ok, _ = triage.resolve_picks([pick("HN", "https://a/1"), pick("Reddit", "https://a/2")], arts)
+        self.assertEqual([p.headline_only for p in ok], [True, True])
+
+    def test_when_shows_date_for_date_only_feeds(self):  # Nature/PubMed stamp midnight
+        t = datetime(2026, 9, 24, 0, 0, tzinfo=timezone.utc).astimezone().replace(hour=0, minute=0, second=0)
+        self.assertEqual(output._when(t.isoformat()), t.strftime("%a %-d %b"))
+        self.assertEqual(output._when(""), "")
+
+    def test_best_picks_lead_in_a_top_section(self):
+        picks = [pick("mid", "https://x/m", 7, "ai"), pick("best", "https://x/b", 10, "japan"),
+                 pick("good", "https://x/g", 9, "cars"), pick("jp", "https://x/j", 8, "japan")]
+        md = output.format_brief(result(picks), "2026-09-27")
+        self.assertLess(md.index("## ★ TOP"), md.index("## AI"))
+        top = md[md.index("## ★ TOP"):md.index("## AI")]
+        self.assertEqual([t for t in ("[best]", "[good]") if t in top], ["[best]", "[good]"])
+        self.assertLess(top.index("[best]"), top.index("[good]"))
+        self.assertEqual(md.count("[best]"), 1)  # moved, not duplicated
+        self.assertNotIn("## CARS", md)          # its only pick went to the top
 
 
 class HistoryTests(unittest.TestCase):
@@ -326,6 +375,19 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual(urls, {"https://x/old"})
             urls, _ = triage._recent_brief_history([d], 5)
             self.assertEqual(urls, {"https://x/old", "https://x/today"})
+
+    def test_titles_with_brackets_are_remembered(self):
+        # r/LocalLLaMA "[audio.cpp] ..." and HN "... [pdf]" picks: with the 28 h
+        # minimum window, yesterday's picks are back in today's pool.
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "2026-09-26-brief.md").write_text(
+                "- [ ] **[[audio.cpp] 10 hours of audio](https://r/1)**\n"
+                "  *r/LocalLLaMA* · 5 h ago · score 8/10\n"
+                "- [x] **[A paper [pdf]](https://h/2.pdf)**\n"
+                "- **[Old format](https://o/3)**\n")
+            urls, titles = triage._recent_brief_history([d], 5)
+        self.assertEqual(urls, {"https://r/1", "https://h/2.pdf", "https://o/3"})
+        self.assertIn("2026-09-26: [audio.cpp] 10 hours of audio", titles)
 
 
 class LocalCtxTests(unittest.TestCase):
@@ -516,6 +578,25 @@ class TriageFallbackTests(EnvTestCase):
         self.assertEqual(sorted(order), list(range(12)))
         self.assertNotEqual(order, list(range(12)))
 
+    def test_shuffle_seed_changes_with_the_date(self):
+        arts = [Article(f"T{i}", f"https://a/{i}", "s", datetime.now(timezone.utc), "Src", "ai", 1.0) for i in range(12)]
+        seen = []
+        def claude(client, model, system, user_msg, meta, **kw):
+            seen.append(user_msg)
+            return {"summary": "s", "picks": []}, "{}"
+        class Day(datetime):
+            day = "2026-09-27"
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.fromisoformat(cls.day + "T07:00:00")
+        with mock.patch.object(triage, "_triage_via_claude", side_effect=claude), \
+                mock.patch.object(triage, "load_prompt", return_value="SYSTEM"), \
+                mock.patch.object(triage, "datetime", Day):
+            triage.triage(list(arts))
+            Day.day = "2026-09-28"
+            triage.triage(list(arts))
+        self.assertNotEqual(seen[0], seen[1])
+
     def test_fallback_failure_keeps_both_errors(self):
         arts = [Article("T", "https://a/1", "s", datetime.now(timezone.utc), "Src", "ai", 1.0)]
         with mock.patch.object(triage, "_triage_via_claude", side_effect=triage.ClaudeRequestError("HTTP 400 bad param")), \
@@ -525,6 +606,21 @@ class TriageFallbackTests(EnvTestCase):
                 triage.triage(arts)
         self.assertIn("HTTP 400 bad param", str(cm.exception))
         self.assertIn("ollama down", str(cm.exception))
+
+    def test_disabled_fallback_names_both_claude_errors(self):
+        # The catch-up runs Claude-only when the box is short of memory; the
+        # failure note must say why the local model wasn't tried.
+        os.environ["TRIAGE_LOCAL_FALLBACK"] = "0"
+        arts = [Article("T", "https://a/1", "s", datetime.now(timezone.utc), "Src", "ai", 1.0)]
+        with mock.patch.object(triage, "_triage_via_claude", side_effect=[triage.ClaudeRequestError("primary 400"),
+                                                                         RuntimeError("backup down")]), \
+                mock.patch.object(triage, "_triage_via_local") as local, \
+                mock.patch.object(triage, "load_prompt", return_value="SYSTEM"):
+            with self.assertRaises(RuntimeError) as cm:
+                triage.triage(arts)
+        local.assert_not_called()
+        for part in ("primary 400", "backup down", "TRIAGE_LOCAL_FALLBACK=0"):
+            self.assertIn(part, str(cm.exception))
 
 
 # ---------------------------------------------------------------------- output
@@ -618,13 +714,29 @@ class MainTests(EnvTestCase):
         old.write_text("x")
         os.utime(old, (now.timestamp() - 40 * 3600,) * 2)  # the last brief is 40 h old
         hours, since = main.fetch_window_hours(now)
-        self.assertEqual((round(since), hours), (40, 40.5))
+        self.assertEqual((round(since), hours), (40, 41.0))
         os.utime(old, (now.timestamp() - 24 * 3600,) * 2)
         self.assertEqual(main.fetch_window_hours(now)[0], main.WINDOW_MIN_H)
         os.utime(old, (now.timestamp() - 90 * 3600,) * 2)
         self.assertEqual(main.fetch_window_hours(now)[0], main.WINDOW_MAX_H)
         (self.delivered / "2026-09-27-brief.md").write_text("today's, being replaced")
         self.assertEqual(main.fetch_window_hours(now)[0], main.WINDOW_MAX_H)  # today's brief is ignored
+
+    def test_run_uses_and_records_the_fetch_window(self):
+        old = self.delivered / "2025-01-01-brief.md"
+        old.write_text("x")
+        os.utime(old, (datetime.now().timestamp() - 40 * 3600,) * 2)
+        seen = {}
+        def fake_fetch(hours_back=24):
+            seen["hours"] = hours_back
+            f = self.fetched()
+            f.hours_back, f.duplicates_dropped = hours_back, 2
+            return f
+        with mock.patch.object(main, "fetch_all_with_status", side_effect=fake_fetch), \
+                mock.patch.object(main, "triage", return_value=result()):
+            rc, _, _ = main.run()
+        rec = json.loads(next((self.vault / "runs").glob("*/run.json")).read_text())
+        self.assertEqual((rc, round(seen["hours"], 1), round(rec["hours_back"], 1), rec["duplicates_dropped"]), (0, 41.0, 41.0, 2))
 
     def test_bad_model_fails_before_fetching(self):
         os.environ["TRIAGE_MODEL"] = "claude-nope"

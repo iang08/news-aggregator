@@ -29,11 +29,6 @@ sources:
     weight: 2.0
     last_reviewed: 2026-04-28
 
-  - name: "Hacker News (200+ pts)"
-    url: "https://hnrss.org/newest?points=200&count=100"
-    category: ai
-    weight: 1.0
-    last_reviewed: "2026-09-26"
 
   - name: "r/LocalLLaMA"
     url: "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day&limit=9"
@@ -64,9 +59,9 @@ sources:
 
   - name: "Japan Times"
     url: "https://www.japantimes.co.jp/feed/"
-    max_items: 6
+    max_items: 3
     category: japan
-    weight: 0.9
+    weight: 0.7
     last_reviewed: "2026-09-26"
 
   - name: "Willamette Week"
@@ -246,12 +241,6 @@ sources:
     max_items: 6          # ~8.8/day; a third are market ticks
     last_reviewed: 2026-09-26
 
-  - name: "はてなブックマーク 人気エントリー（学び）"
-    url: "https://b.hatena.ne.jp/hotentry/knowledge.rss"
-    category: japan
-    weight: 0.8
-    max_items: 5          # flood guard; ~4/day
-    last_reviewed: 2026-09-26
 
   - name: "サイエンスポータル（JST）"
     url: "https://scienceportal.jst.go.jp/feed/rss.xml"
@@ -371,4 +360,17 @@ sources:
     url: "https://sakana.ai/feed.xml"
     category: ai
     weight: 0.7
+    last_reviewed: 2026-09-26
+
+  # ─── Aggregators: keep LAST — dedupe_links prefers a real summary, then weight, then the first listing ───
+  - name: "Hacker News (200+ pts)"
+    url: "https://hnrss.org/newest?points=200&count=100"
+    category: ai
+    weight: 1.0
+    last_reviewed: "2026-09-26"
+  - name: "はてなブックマーク 人気エントリー（学び）"
+    url: "https://b.hatena.ne.jp/hotentry/knowledge.rss"
+    category: japan
+    weight: 0.8
+    max_items: 5          # flood guard; ~4/day
     last_reviewed: 2026-09-26

@@ -24,21 +24,21 @@ Written 2026-09-26 after the audit (`docs/audit-2026-09-25.md`) and the "Now" fi
 
 Work in a fresh worktree off `origin/main` on the Mac (other sessions share `~/projects/news_agg`; check `git branch --show-current`, never switch its branch). Heavy work runs on EVO-X2 — pre-flight `ollama ps; free -g` as its own step first.
 
-## 1. Prompt v2 A/B (audit X1)
+## 1. Prompt A/B — re-check on production pools (audit X1)
 
-`prompts/triage_v2.md` encodes Ian's answers and the audit's prompt findings (stale venture list, "directly relevant" boilerplate, one story per pick, direction for currency moves, a one-sentence top summary, no padding).
+**Done 2026-09-26 on replayed pools** (`docs/promptab-2026-09-26.md`): v2 beat v1 on all 3 pools (every v2 rep above every v1 rep), 0% geopolitics, venture named in 75% of why-lines; it went live as `prompts/triage.md` (v1 kept as `prompts/triage_v1.md`) with four untested wording fixes from the verdict. Re-check now on fresh production pools that share no articles:
 
-1. Dry run: `python -m aggregator.replay --runs ~/news_agg_out/runs/2026-09-2*_07* --prompt prompts/triage.md --prompt prompts/triage_v2.md --reps 3 --out ~/news_agg_audit/replay/v2` (on EVO-X2, cwd `~/projects/news_agg`). It prints the call count and cost. Then add `--apply`.
-2. Judge blind, as in the model check: pool every picked article per pool into an items file (article title/source/summary from `pool.json`, not the model's rationale), have 3 independent judges rate each item 0–3 for Ian (profile above) and flag geopolitics, then score each arm per pool. Compare arms against the within-arm (rep-vs-rep) spread — identical re-runs share only ~9/12 picks.
-3. Recommend v2 only if its judged mean is ≥ v1's on most pools and its geopolitics share is lower. Show Ian the numbers; switching `prompts/triage.md` is his call.
+1. Dry run: `python -m aggregator.replay --runs ~/news_agg_out/runs/2026-09-2*_07* --prompt prompts/triage_v1.md --prompt prompts/triage.md --reps 3 --out ~/news_agg_audit/replay/v2prod` (on EVO-X2, cwd `~/projects/news_agg`). Then `--apply`.
+2. Judge blind as before (items files from `pool.json`, 3 judges, 0-3 + geopolitics flag), and check the wording fixes held: no "The most useful item today is", no "bears directly on", no two picks on one story, "you" instead of "Ian".
+3. Report to Ian. If the live prompt lost, say so plainly and recommend reverting.
 
 ## 2. Source trial (early read)
 
 From `runs/*/run.json` (per-source status) and `picks.json`: per feed — items in pool, picks, pick rate, failures, stale flags, capped counts. After only 3–4 days, report; don't drop anything yet. Real verdicts after ~14 runs (keep: ≥1 pick and not mostly unticked; tighten: pool share >3× pick share; drop: 0 picks from ≥10 items or a persistent dead/stale flag; feeds under 0.2/day get 8 weeks).
 
-## 3. Dynamic fetch window (audit X3)
+## 3. Dynamic fetch window (audit X3) — DONE (e44112f)
 
-A late or missed run loses news: set `hours_back = min(48, max(28, hours since the last brief's generation + 0.5))` in `main.py` (last brief = newest `runs/*/run.json` with a brief), keep per-feed `window_hours` as a floor, and test it.
+`main.fetch_window_hours`: hours since the newest earlier `*-brief.md` was written (file mtime, not `run.json`) + 0.5, clamped to 28–48 h; per-feed `window_hours` only reaches further back. Recorded as `hours_back` in `run.json`.
 
 ## 4. Feedback
 

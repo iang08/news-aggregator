@@ -39,9 +39,9 @@ DEAD_AFTER_RUNS = 3
 MANY_DOWN_SHARE = 0.25
 # This many picks naming no input article (invented URLs) is worth a banner.
 MANY_UNMATCHED = 3
-# Fetch window: since the last brief (+30 min), at least 28 h so consecutive
+# Fetch window: since the last brief (+1 h: it was written at the end of a run whose feeds were fetched up to ~45 min earlier), at least 28 h so consecutive
 # 07:00 runs overlap a little (cross-day dedup removes repeats), at most 48 h.
-# A fixed 24 h lost ~15 h of news after the late 2026-09-25 run.
+# The late 2026-09-25 run's fixed 24 h window missed ~15 h (09-24 07:00-21:58).
 WINDOW_MIN_H = 28
 WINDOW_MAX_H = 48
 
@@ -64,7 +64,7 @@ def fetch_window_hours(now: datetime) -> tuple[float, float | None]:
     if newest is None:
         return float(WINDOW_MIN_H), None
     since = (now.timestamp() - newest) / 3600
-    return min(WINDOW_MAX_H, max(WINDOW_MIN_H, since + 0.5)), since
+    return min(WINDOW_MAX_H, max(WINDOW_MIN_H, since + 1.0)), since
 
 
 def setup_logging() -> None:
