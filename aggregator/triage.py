@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
 import anthropic
 import httpx
@@ -38,10 +38,13 @@ MODEL = "claude-opus-5-5"
 # Opus 5.5 became the default 2026-09-26 after a blind-judged check (3 reps × 2
 # pools): best judged picks (1.67/1.45 vs Sonnet 4.6's 1.64/1.19 on a 0-3
 # scale; 50% vs 20% "worth reading" on the second pool), the most repeatable
-# (rep overlap 0.85/0.75), never mangled URLs, ~$0.16/run. If it rejects the
-# request itself (a 4xx, a refusal from its broader safety classifiers, a cut at
-# max_tokens), the known-good Sonnet 4.6 gets one try before the local model.
+# (rep overlap 0.85/0.75), never mangled URLs, ~$0.16/run. Provisional until the
+# re-check on >= 3 saved production pools (docs/NEXT.md). If the primary fails
+# for any reason — a 4xx, a refusal from its broader safety classifiers, a cut
+# at max_tokens, or overload/stalls after its retries (capacity is per model) —
+# the known-good Sonnet 4.6 gets ONE attempt before the local model.
 BACKUP_MODEL = "claude-sonnet-4-6"
+BACKUP_ATTEMPTS = 1  # a whole-Anthropic outage costs at most one extra call
 
 # Request parameters differ by model, and a wrong one is a 400 — on 2026-09-25
 # Haiku 4.5 rejected `effort` and Opus 5.5 rejected disabled thinking. Before
@@ -371,7 +374,8 @@ def _usage_dict(message) -> dict:
 
 
 def _triage_via_claude(
-    client: Anthropic, model: str, system_prompt: str, user_msg: str, meta: dict
+    client: Anthropic, model: str, system_prompt: str, user_msg: str, meta: dict,
+    max_attempts: int = MAX_STREAM_ATTEMPTS,
 ) -> tuple[dict, str]:
     """Primary path: stream from Claude with structured output, per-event
     instrumentation, and the stall/overload/JSON retry loop. Returns (parsed,
@@ -381,7 +385,7 @@ def _triage_via_claude(
     decides whether to fall back."""
     raw = ""
     attempts: list[dict] = meta.setdefault("attempts", [])
-    for attempt in range(1, MAX_STREAM_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         stream_start = time.monotonic()
         first_event_at: float | None = None
         delta_count = 0
@@ -437,6 +441,8 @@ def _triage_via_claude(
             attempts.append({"attempt": attempt, "seconds": round(total, 1), "error": None})
             logger.info(f"usage: {meta['usage']}; stop_reason={message.stop_reason}; request_id={meta['request_id']}")
 
+            if message.stop_reason in ("max_tokens", "refusal"):
+                attempts[-1]["error"] = message.stop_reason  # a cut or refused attempt is not a success
             if message.stop_reason == "max_tokens":
                 raise ClaudeTruncatedError(
                     f"response hit max_tokens={MAX_TOKENS}; the JSON is incomplete"
@@ -457,14 +463,17 @@ def _triage_via_claude(
             attempts.append({"attempt": attempt, "seconds": round(time.monotonic() - stream_start, 1),
                              "error": f"HTTP {e.status_code} {etype}".strip()})
             if not _is_retryable(e):
+                body = e.body if isinstance(getattr(e, "body", None), dict) else {}
+                err = body.get("error") if isinstance(body.get("error"), dict) else {}
+                detail = err.get("message") or getattr(e, "message", str(e))
                 raise ClaudeRequestError(
-                    f"Claude rejected the request (HTTP {e.status_code} {etype}): {getattr(e, 'message', e)}"
+                    f"Claude rejected the request (HTTP {e.status_code} {etype}): {detail}"
                 ) from e
-            if attempt == MAX_STREAM_ATTEMPTS:
-                logger.error(f"API error on attempt {attempt}/{MAX_STREAM_ATTEMPTS} (HTTP {e.status_code} {etype}); giving up")
+            if attempt == max_attempts:
+                logger.error(f"API error on attempt {attempt}/{max_attempts} (HTTP {e.status_code} {etype}); giving up")
                 raise
             logger.warning(
-                f"API error on attempt {attempt}/{MAX_STREAM_ATTEMPTS} (HTTP {e.status_code} {etype}); "
+                f"API error on attempt {attempt}/{max_attempts} (HTTP {e.status_code} {etype}); "
                 f"retrying in {STREAM_RETRY_BACKOFF_S}s"
             )
             time.sleep(STREAM_RETRY_BACKOFF_S)
@@ -484,13 +493,13 @@ def _triage_via_claude(
             )
             attempts.append({"attempt": attempt, "seconds": round(failure_elapsed, 1),
                              "error": f"{type(e).__name__}"})
-            if attempt == MAX_STREAM_ATTEMPTS:
+            if attempt == max_attempts:
                 logger.error(
-                    f"Stream attempt {attempt}/{MAX_STREAM_ATTEMPTS} failed ({type(e).__name__}); giving up. {diag}"
+                    f"Stream attempt {attempt}/{max_attempts} failed ({type(e).__name__}); giving up. {diag}"
                 )
                 raise
             logger.warning(
-                f"Stream attempt {attempt}/{MAX_STREAM_ATTEMPTS} failed ({type(e).__name__}: {e}); "
+                f"Stream attempt {attempt}/{max_attempts} failed ({type(e).__name__}: {e}); "
                 f"retrying in {STREAM_RETRY_BACKOFF_S}s. {diag}"
             )
             time.sleep(STREAM_RETRY_BACKOFF_S)
@@ -499,14 +508,14 @@ def _triage_via_claude(
             # retry rather than nuking the brief. (Partial-JSON salvage was
             # considered and rejected: fragile, and structured output moots it.)
             attempts[-1]["error"] = "JSONDecodeError"
-            if attempt == MAX_STREAM_ATTEMPTS:
+            if attempt == max_attempts:
                 logger.error(
-                    f"JSON parse failed on attempt {attempt}/{MAX_STREAM_ATTEMPTS} "
+                    f"JSON parse failed on attempt {attempt}/{max_attempts} "
                     f"(despite structured output); giving up. Raw response:\n{raw}"
                 )
                 raise RuntimeError(f"Claude returned non-JSON output: {e}") from e
             logger.warning(
-                f"JSON parse failed on attempt {attempt}/{MAX_STREAM_ATTEMPTS} ({e}); "
+                f"JSON parse failed on attempt {attempt}/{max_attempts} ({e}); "
                 f"retrying in {STREAM_RETRY_BACKOFF_S}s"
             )
             time.sleep(STREAM_RETRY_BACKOFF_S)
@@ -620,15 +629,25 @@ def _triage_via_local(
     ) from last_err
 
 
+# Query parameters that only track the click; everything else (an article id,
+# an HN item id) identifies the page and is kept.
+_TRACKING_PARAMS = {"ref", "ref_src", "fbclid", "gclid", "maca", "traffic_source", "cmpid", "ncid", "rss"}
+
+
 def _norm_url(u: str) -> str:
-    """host + path, without scheme, www., query, fragment or trailing slash."""
+    """host + decoded path + non-tracking query, without scheme, www., fragment
+    or trailing slash."""
     try:
         parts = urlsplit(u.strip())
+        query = sorted(
+            (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if not (k.lower().startswith(("utm_", "at_")) or k.lower() in _TRACKING_PARAMS)
+        )
     except ValueError:
         return u.strip()
     host = parts.netloc.lower()
     host = host[4:] if host.startswith("www.") else host
-    return host + parts.path.rstrip("/")
+    return host + unquote(parts.path).rstrip("/") + ("?" + urlencode(query) if query else "")
 
 
 def _norm_title(t: str) -> str:
@@ -640,8 +659,9 @@ def resolve_picks(picks: list[TriagePick], articles: list[Article]) -> tuple[lis
     source from that article. Models drop ?utm-style queries (so cross-day dedup
     — an exact match on the feed's link — never saw them again) and sometimes
     re-pick a story from the title-only "already covered" list with an invented
-    URL (7 of 12 in one local run, 2026-09-26). Matching: exact URL, then URL
-    without query/scheme/www (only where that is unambiguous), then exact title.
+    URL (7 of 12 in one local run, 2026-09-26). Matching: exact URL, then the
+    URL without tracking parameters/scheme/www/encoding differences (only where
+    that is unambiguous), then exact title.
     Returns (resolved, unmatched)."""
     by_url = {a.link: a for a in articles}
     norm_count: dict[str, int] = {}
@@ -730,7 +750,8 @@ def triage(articles: list[Article]) -> TriageResult:
     logger.info(f"Sending {len(articles)} articles to Claude ({model}) for triage...")
 
     user_msg = (
-        f"Here are {len(articles)} articles from the last 24 hours. "
+        f"Here are {len(articles)} recent articles (most from the last 24 hours; "
+        f"journal and arXiv feeds reach back up to 4 days). "
         f"Triage them per the instructions in your system prompt."
         f"{recent_block}\n\n"
         f"{article_block}"
@@ -760,19 +781,23 @@ def triage(articles: list[Article]) -> TriageResult:
     try:
         try:
             parsed, raw = _triage_via_claude(client, model, system_prompt, user_msg, meta)
-        except (ClaudeRequestError, ClaudeTruncatedError) as model_err:
-            # The request itself failed for this model — worth one try on the
-            # known-good backup before leaving Claude altogether.
+        except Exception as model_err:
+            # Any primary failure — including overload or stalls, which are per
+            # model — is worth one attempt on the known-good backup before
+            # leaving Claude altogether.
             if model == BACKUP_MODEL:
                 raise
-            fallback_reason = f"{model}: {type(model_err).__name__}: {model_err}"[:300]
-            logger.error(f"{fallback_reason} — retrying once on {BACKUP_MODEL}")
-            meta["backup_attempts"] = meta.pop("attempts", [])
-            parsed, raw = _triage_via_claude(client, BACKUP_MODEL, system_prompt, user_msg, meta)
+            fallback_reason = f"{model}: {type(model_err).__name__}: {model_err}"[:180]
+            logger.error(f"{fallback_reason} — trying {BACKUP_MODEL} once")
+            meta["primary"] = {"model": model, "attempts": meta.pop("attempts", []),
+                               **{k: meta.pop(k) for k in ("usage", "stop_reason", "request_id") if k in meta}}
+            meta["backup_model"] = BACKUP_MODEL
+            parsed, raw = _triage_via_claude(client, BACKUP_MODEL, system_prompt, user_msg, meta,
+                                             max_attempts=BACKUP_ATTEMPTS)
             engine = f"claude:{BACKUP_MODEL}"
     except Exception as claude_err:
-        reason = f"{type(claude_err).__name__}: {claude_err}"
-        fallback_reason = (f"{fallback_reason}; then {reason}" if fallback_reason else reason)[:400]
+        reason = f"{type(claude_err).__name__}: {claude_err}"[:180]
+        fallback_reason = f"{fallback_reason}; then {reason}" if fallback_reason else reason
         if not fallback_enabled:
             raise
         logger.error(
@@ -784,8 +809,8 @@ def triage(articles: list[Article]) -> TriageResult:
         except Exception as local_err:
             # Keep BOTH causes: the failure note should say why Claude failed too.
             raise RuntimeError(
-                f"Claude failed ({fallback_reason[:200]}); local fallback failed "
-                f"({type(local_err).__name__}: {str(local_err)[:200]})"
+                f"Claude failed ({fallback_reason}); local fallback failed "
+                f"({type(local_err).__name__}: {str(local_err)[:120]})"
             ) from local_err
         engine = f"local:{local_model}"
         logger.info(f"Brief generated via FALLBACK engine: {engine}")

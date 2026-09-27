@@ -124,7 +124,6 @@ def alert_for(path: str) -> tuple[str, str] | None:
 
 
 def move_new_files() -> None:
-    os.makedirs(VAULT, exist_ok=True)
     for pattern in ("*-brief.md", "*-brief-FAILED.md"):
         for src in glob.glob(os.path.join(INBOX, pattern)):
             name = os.path.basename(src)
@@ -132,6 +131,7 @@ def move_new_files() -> None:
             last_err = None
             for _ in range(3):
                 try:
+                    os.makedirs(VAULT, exist_ok=True)  # inside the try: an unreachable vault must reach the stuck alert
                     shutil.move(src, dest)
                     logline(f"moved {name} -> vault")
                     last_err = None

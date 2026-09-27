@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import feedparser
 import httpx
@@ -60,7 +61,7 @@ STALE_GAPS = 3
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _SCRIPT_RE = re.compile(r"<(script|style)\b.*?</\1\s*>", re.I | re.S)
-_WS_RE = re.compile(r"\s+")
+_WS_RE = re.compile(r"[^\S\u3000]+")  # collapse whitespace, but keep Japanese full-width spaces
 
 
 @dataclass
@@ -116,6 +117,18 @@ def clean_text(s: str | None) -> str:
     s = _SCRIPT_RE.sub(" ", s)
     s = _TAG_RE.sub(" ", s)
     return _WS_RE.sub(" ", html.unescape(s)).strip()
+
+
+def canonical_link(link: str) -> str:
+    """PubMed adds per-fetch query parameters (ff=<timestamp>, utm_*), so the
+    same paper got a new URL every day and cross-day dedup never matched it."""
+    try:
+        p = urlsplit(link)
+    except ValueError:
+        return link
+    if p.netloc.lower() == "pubmed.ncbi.nlm.nih.gov" and p.query:
+        return urlunsplit((p.scheme, p.netloc, p.path, "", ""))
+    return link
 
 
 def _entry_text(value: str | None, detail: dict | None) -> str:
@@ -236,7 +249,7 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article
                 summary = body
         articles.append(Article(
             title=_entry_text(entry.get("title"), entry.get("title_detail")) or "(no title)",
-            link=entry.get("link", ""),
+            link=canonical_link(entry.get("link", "")),
             summary=summary[:SUMMARY_MAX_CHARS],
             published=published,
             source_name=name,

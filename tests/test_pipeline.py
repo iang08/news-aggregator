@@ -130,6 +130,14 @@ class FetchTests(unittest.TestCase):
         arts, _ = self.fetch_with(atom)
         self.assertEqual((arts[0].title, arts[0].summary), ("The <dialog> element", "Body"))
 
+    def test_pubmed_links_lose_per_fetch_params(self):
+        self.assertEqual(fetch.canonical_link("https://pubmed.ncbi.nlm.nih.gov/41000001/?utm_source=x&ff=20260926&v=2.18"),
+                         "https://pubmed.ncbi.nlm.nih.gov/41000001/")
+        self.assertEqual(fetch.canonical_link("https://q/view?id=1"), "https://q/view?id=1")
+
+    def test_japanese_fullwidth_space_kept(self):
+        self.assertEqual(fetch.clean_text("7％超え　住宅購入の負担増 \n x&nbsp;&nbsp;y"), "7％超え　住宅購入の負担増 x y")
+
     def test_empty_channel_is_an_error(self):
         # a wrong note.com ID answers 200 with an empty channel
         arts, st = self.fetch_with(rss([]))
@@ -260,6 +268,29 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual([p.title for p in unmatched], ["Old story"])
 
 
+class ResolveEdgeTests(unittest.TestCase):
+    def arts(self):
+        now = datetime.now(timezone.utc)
+        return [Article("Deep dive on X", "https://sub.stack/p/x?utm_source=rss&utm_medium=feed", "s", now, "HN", "ai", 1.0),
+                Article("Q one", "https://q/view?id=1", "s", now, "Q", "ai", 1.0),
+                Article("Q two", "https://q/view?id=2&utm_source=rss", "s", now, "Q", "ai", 1.0),
+                Article("日本語", "https://jp/%E8%A8%98%E4%BA%8B", "s", now, "J", "japan", 1.0)]
+
+    def test_query_ids_are_kept_and_tracking_dropped(self):
+        ok, bad = triage.resolve_picks([pick("whatever", "https://q/view?id=2")], self.arts())
+        self.assertEqual([p.url for p in ok], ["https://q/view?id=2&utm_source=rss"])
+        ok, bad = triage.resolve_picks([pick("Some other headline", "https://q/view")], self.arts())
+        self.assertEqual((ok, [p.url for p in bad]), ([], ["https://q/view"]))
+
+    def test_comments_url_falls_through_to_title(self):
+        ok, _ = triage.resolve_picks([pick("Deep dive on X", "https://news.ycombinator.com/item?id=41")], self.arts())
+        self.assertEqual([p.url for p in ok], ["https://sub.stack/p/x?utm_source=rss&utm_medium=feed"])
+
+    def test_percent_encoding_and_utm(self):
+        ok, bad = triage.resolve_picks([pick("t", "https://jp/記事/"), pick("t2", "http://www.sub.stack/p/x")], self.arts())
+        self.assertEqual((len(ok), bad), (2, []))
+
+
 class HistoryTests(unittest.TestCase):
     def test_same_day_rerun_ignores_todays_brief(self):
         with tempfile.TemporaryDirectory() as d:
@@ -289,6 +320,8 @@ def api_error(status: int, etype: str) -> anthropic.APIStatusError:
 
 
 class FakeStream:
+    request_id = "req_stream"
+
     def __init__(self, message=None, exc=None):
         self.message, self.exc = message, exc
     def __enter__(self): return self
@@ -340,7 +373,7 @@ class ClaudePathTests(unittest.TestCase):
         (parsed, _), client, meta = self.call([api_error(529, "overloaded_error"), message()])
         self.assertEqual(parsed["summary"], "s")
         self.assertEqual(len(client.calls), 2)
-        self.assertEqual(meta["request_id"], "req_1")
+        self.assertEqual(meta["request_id"], "req_stream")  # from the stream, not the final message
 
     def test_mid_stream_overload_with_200_status_is_retried(self):
         res, client, _ = self.call([api_error(200, "overloaded_error")] * 3)
@@ -379,7 +412,7 @@ class TriageFallbackTests(EnvTestCase):
         good = {"summary": "day", "picks": [{"title": "T", "source": "Src", "category": "ai", "url": "https://a/1",
                                              "summary": "w", "interest_score": 8, "tags": []}]}
         calls = []
-        def claude(client, model, *a):
+        def claude(client, model, *a, **kw):
             calls.append(model)
             if model == triage.MODEL:
                 raise triage.ClaudeRequestError("model refused the request")
@@ -395,6 +428,39 @@ class TriageFallbackTests(EnvTestCase):
         status, notices = main.assess(fetch.FetchResult(arts, []), res, [])
         self.assertEqual(status, "degraded")
         self.assertIn("Backup model", notices[0])
+
+    def _run_real(self, outcomes):
+        """triage() with the real _triage_via_claude over a fake client."""
+        arts = [Article("T", "https://a/1?utm_source=rss", "s", datetime.now(timezone.utc), "Src", "ai", 1.0)]
+        client = FakeClient(outcomes)
+        local_json = {"summary": "l", "picks": []}
+        with mock.patch.object(triage, "Anthropic", return_value=client), \
+                mock.patch.object(triage, "_triage_via_local", return_value=(local_json, "{}")) as local, \
+                mock.patch.object(triage, "load_prompt", return_value="SYSTEM"), \
+                mock.patch.object(triage.time, "sleep", lambda s: None):
+            res = triage.triage(arts)
+        return res, client, local
+
+    def test_overload_on_primary_goes_to_backup(self):
+        good = message('{"summary": "s", "picks": [{"title": "T", "source": "x", "category": "ai", '
+                       '"url": "https://a/1", "summary": "w", "interest_score": 8, "tags": []}, '
+                       '{"title": "Invented", "source": "x", "category": "ai", "url": "https://jt/fake", '
+                       '"summary": "w", "interest_score": 9, "tags": []}]}')
+        for failure in (api_error(529, "overloaded_error"), httpx.ReadTimeout("stall")):
+            res, client, local = self._run_real([failure] * 3 + [good])
+            self.assertEqual([c["model"] for c in client.calls], [triage.MODEL] * 3 + [triage.BACKUP_MODEL])
+            local.assert_not_called()
+            self.assertEqual(res.engine, f"claude:{triage.BACKUP_MODEL}")
+            self.assertEqual(len(res.meta["primary"]["attempts"]), 3)
+            # picks are resolved inside triage(): query restored, invented one dropped
+            self.assertEqual([p.url for p in res.picks], ["https://a/1?utm_source=rss"])
+            self.assertEqual(res.meta["unmatched_picks"], 1)
+
+    def test_backup_gets_one_attempt_then_local(self):
+        res, client, local = self._run_real([api_error(529, "overloaded_error")] * 4)
+        self.assertEqual(len(client.calls), 4)  # 3 primary + 1 backup
+        local.assert_called_once()
+        self.assertTrue(res.engine.startswith("local:"))
 
     def test_rejected_request_falls_back_with_reason(self):
         arts = [Article("T", "https://a/1", "s", datetime.now(timezone.utc), "Src", "ai", 1.0)]
@@ -620,6 +686,18 @@ class MoverTests(unittest.TestCase):
         with mock.patch.object(self.m.shutil, "move", side_effect=PermissionError("TCC denied")), \
                 mock.patch.object(self.m.time, "sleep", lambda s: None):
             self.m.move_new_files()
+            self.m.move_new_files()
+        self.assertEqual([t for t, _ in self.notes], ["News brief stuck"])
+
+    def test_unreachable_vault_still_alerts(self):
+        Path(self.m.INBOX, "2026-09-27-brief.md").write_text("---\nstatus: ok\n---\n")
+        real = os.makedirs
+        def makedirs(path, *a, **k):
+            if path == self.m.VAULT:
+                raise PermissionError("TCC denied")
+            return real(path, *a, **k)
+        with mock.patch.object(self.m.os, "makedirs", makedirs), \
+                mock.patch.object(self.m.time, "sleep", lambda s: None):
             self.m.move_new_files()
         self.assertEqual([t for t, _ in self.notes], ["News brief stuck"])
 
