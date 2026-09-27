@@ -36,6 +36,8 @@ from aggregator.output import existing_brief, write_brief, write_failure_note
 DEAD_AFTER_RUNS = 3
 # This share of feeds failing in one run points at the network, not the feeds.
 MANY_DOWN_SHARE = 0.25
+# This many picks naming no input article (invented URLs) is worth a banner.
+MANY_UNMATCHED = 3
 
 
 def setup_logging() -> None:
@@ -86,6 +88,14 @@ def assess(fetch: FetchResult, result: TriageResult, dead: list[SourceStatus]) -
             f"**Local fallback** ({result.engine.split(':', 1)[1]}) wrote this brief — "
             f"Claude failed: {result.fallback_reason or 'unknown error'}"
         )
+    elif result.fallback_reason:
+        notices.append(
+            f"**Backup model** ({result.engine.split(':', 1)[1]}) wrote this brief — "
+            f"the primary failed: {result.fallback_reason}"
+        )
+    unmatched = result.meta.get("unmatched_picks", 0)
+    if unmatched >= MANY_UNMATCHED:
+        notices.append(f"**{unmatched} picks named articles that weren't in today's input** (invented URLs) and were dropped.")
     if not result.picks:
         notices.append("The model returned **no picks** today.")
     if dead:
@@ -190,7 +200,8 @@ def run() -> tuple[int, str, str]:
         # Step 3: Write the brief to Obsidian
         dead = dead_sources(fetch.sources, runs)
         status, notices = assess(fetch, result, dead)
-        brief_path = write_brief(result, status=status, notices=notices, sources_down=fetch.failed)
+        brief_path = write_brief(result, status=status, notices=notices, sources_down=fetch.failed,
+                                 sources_stale=[s for s in fetch.sources if s.ok and s.stale])
         for n in notices:
             logger.warning(f"DEGRADED: {n}")
         logger.info(f"=== Run complete ({status}). Brief at: {brief_path} ===")

@@ -130,9 +130,53 @@ class FetchTests(unittest.TestCase):
         arts, _ = self.fetch_with(atom)
         self.assertEqual((arts[0].title, arts[0].summary), ("The <dialog> element", "Body"))
 
-    def test_empty_but_valid_feed_is_ok(self):
+    def test_empty_channel_is_an_error(self):
+        # a wrong note.com ID answers 200 with an empty channel
         arts, st = self.fetch_with(rss([]))
+        self.assertEqual((arts, st.ok), ([], False))
+        self.assertIn("feed has no entries", st.error)
+
+    def test_valid_feed_with_nothing_in_window_is_ok(self):
+        arts, st = self.fetch_with(rss([("old", "https://a/o", self.now - timedelta(days=3), "s")]))
         self.assertEqual((arts, st.ok), ([], True))
+
+    def test_future_dated_entries_skipped(self):
+        arts, st = self.fetch_with(rss([("pinned", "https://a/p", self.now + timedelta(days=400), "s"),
+                                        ("new", "https://a/n", self.now, "s")]))
+        self.assertEqual(([a.title for a in arts], st.future_skipped), (["new"], 1))
+
+    def test_short_summary_falls_back_to_content(self):
+        body = ('<?xml version="1.0"?><rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">'
+                '<channel><title>T</title><item><title>Post</title><link>https://a/1</link>'
+                f'<pubDate>{self.now.strftime("%a, %d %b %Y %H:%M:%S +0000")}</pubDate>'
+                '<description>Subtitle only</description>'
+                '<content:encoded><![CDATA[<p>' + "Real body text. " * 20 + '</p>]]></content:encoded>'
+                '</item></channel></rss>').encode()
+        arts, _ = self.fetch_with(body)
+        self.assertTrue(arts[0].summary.startswith("Real body text."))
+
+    def test_stale_feed_flagged(self):
+        items = [(f"p{i}", f"https://a/{i}", self.now - timedelta(days=60 + i), "s") for i in range(5)]
+        _, st = self.fetch_with(rss(items))
+        self.assertTrue(st.ok and st.stale)
+        _, st = self.fetch_with(rss([(f"p{i}", f"https://a/{i}", self.now - timedelta(days=2 + i), "s") for i in range(5)]))
+        self.assertFalse(st.stale)
+        _, st = self.fetch_with(rss(items), src={**self.src, "stale_days": 150})  # a quarterly journal
+        self.assertFalse(st.stale)
+        issue = self.now - timedelta(days=80)  # one journal issue, all entries the same date
+        _, st = self.fetch_with(rss([(f"a{i}", f"https://a/{i}", issue, "s") for i in range(6)]))
+        self.assertFalse(st.stale)
+
+    def test_per_source_window_and_order(self):
+        srcs = [{"name": f"S{i}", "url": f"https://f/{i}", "category": "ai", "weight": 1.0, "max_items": 0,
+                 "window_hours": 96 if i == 1 else 0} for i in range(4)]
+        two_days = self.now - timedelta(hours=48)
+        def download(url):
+            return 200, {}, url, rss([(f"t{url[-1]}", f"https://a/{url[-1]}", two_days, "s")])
+        with mock.patch.object(fetch, "load_sources", return_value=srcs), mock.patch.object(fetch, "_download", download):
+            r = fetch.fetch_all_with_status(24)
+        self.assertEqual([a.title for a in r.articles], ["t1"])  # only the 96 h source reaches back 48 h
+        self.assertEqual([s.name for s in r.sources], ["S0", "S1", "S2", "S3"])  # sources.yaml order kept
 
     def test_timeout_becomes_status(self):
         _, st = self.fetch_with(exc=FeedError("timed out (ReadTimeout)"))
@@ -200,6 +244,20 @@ class PickTests(unittest.TestCase):
         self.assertEqual(len({p.url for p in kept}), len(kept))
         self.assertEqual([p.interest_score for p in kept], sorted((p.interest_score for p in kept), reverse=True))
         self.assertEqual(len(kept) + len(dropped), 17)
+
+
+class ResolveTests(unittest.TestCase):
+    def test_resolve_restores_links_and_drops_invented(self):
+        arts = [Article("日本語の見出し", "https://jp/a?utm_source=rss", "s", datetime.now(timezone.utc), "NHK", "japan", 1.0),
+                Article("Same path one", "https://q/view?id=1", "s", datetime.now(timezone.utc), "Q", "ai", 1.0),
+                Article("Same path two", "https://q/view?id=2", "s", datetime.now(timezone.utc), "Q", "ai", 1.0)]
+        picks = [pick("Japanese headline (translated)", "https://jp/a", 9),        # query stripped -> restored
+                 pick("Same path two", "https://q/view", 8),                        # ambiguous path -> title match
+                 pick("Old story", "https://www.japantimes.co.jp/2026/09/26/x", 7)]  # invented -> dropped
+        ok, unmatched = triage.resolve_picks(picks, arts)
+        self.assertEqual([(p.url, p.title, p.source) for p in ok],
+                         [("https://jp/a?utm_source=rss", "日本語の見出し", "NHK"), ("https://q/view?id=2", "Same path two", "Q")])
+        self.assertEqual([p.title for p in unmatched], ["Old story"])
 
 
 class HistoryTests(unittest.TestCase):
@@ -316,6 +374,28 @@ class ClaudePathTests(unittest.TestCase):
 
 
 class TriageFallbackTests(EnvTestCase):
+    def test_primary_rejection_uses_backup_model_first(self):
+        arts = [Article("T", "https://a/1", "s", datetime.now(timezone.utc), "Src", "ai", 1.0)]
+        good = {"summary": "day", "picks": [{"title": "T", "source": "Src", "category": "ai", "url": "https://a/1",
+                                             "summary": "w", "interest_score": 8, "tags": []}]}
+        calls = []
+        def claude(client, model, *a):
+            calls.append(model)
+            if model == triage.MODEL:
+                raise triage.ClaudeRequestError("model refused the request")
+            return good, "{}"
+        with mock.patch.object(triage, "_triage_via_claude", side_effect=claude), \
+                mock.patch.object(triage, "_triage_via_local") as local, \
+                mock.patch.object(triage, "load_prompt", return_value="SYSTEM"):
+            res = triage.triage(arts)
+        self.assertEqual(calls, [triage.MODEL, triage.BACKUP_MODEL])
+        local.assert_not_called()
+        self.assertEqual(res.engine, f"claude:{triage.BACKUP_MODEL}")
+        self.assertIn("refused", res.fallback_reason)
+        status, notices = main.assess(fetch.FetchResult(arts, []), res, [])
+        self.assertEqual(status, "degraded")
+        self.assertIn("Backup model", notices[0])
+
     def test_rejected_request_falls_back_with_reason(self):
         arts = [Article("T", "https://a/1", "s", datetime.now(timezone.utc), "Src", "ai", 1.0)]
         local = {"summary": "local day", "picks": [
@@ -565,7 +645,12 @@ class ReplayTests(EnvTestCase):
         self.replay = replay
         self.run = self.vault / "runs" / "2026-09-27_070001"
         self.run.mkdir(parents=True)
-        (self.run / "user_msg.txt").write_text("Here are 1 articles...\n[1] T")
+        (self.run / "user_msg.txt").write_text("Here are 1 articles...\n[1] T\n    URL: https://x/1\n")
+        (self.run / "pool.json").write_text(json.dumps([
+            {"title": "T", "link": "https://x/1", "summary": "s", "published": "2026-09-27T06:00:00+00:00",
+             "source_name": "S", "source_category": "world", "source_weight": 1.0},
+            {"title": "Deduped", "link": "https://x/2", "summary": "s", "published": "2026-09-27T06:00:00+00:00",
+             "source_name": "S", "source_category": "world", "source_weight": 1.0}]))
         self.prompt = self.dir / "p.md"
         self.prompt.write_text("SYSTEM")
 
@@ -586,4 +671,6 @@ class ReplayTests(EnvTestCase):
             self.replay.main(args)  # second pass reuses the saved results
         self.assertEqual(call.call_count, 2)
         summary = (self.dir / "o" / "summary.md").read_text()
-        self.assertIn("| p@claude-sonnet-4-6 | 2/2 | 1.0 | 1.00 | 100% | 100% | 2 |", summary)
+        self.assertIn(f"| p@{triage.MODEL} | 2/2 | 1.0 | 1.00 | 100% | 100% | 2 |", summary)
+        self.assertEqual([a.link for a in self.replay.sent_articles(self.run, (self.run / "user_msg.txt").read_text())],
+                         ["https://x/1"])

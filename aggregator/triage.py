@@ -15,9 +15,10 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import anthropic
 import httpx
@@ -33,7 +34,14 @@ logger = logging.getLogger(__name__)
 # claude-sonnet-4-5-20250929 to claude-sonnet-4-6 (current Sonnet) — a
 # newer model routes to different inference infrastructure, which may
 # resolve the mid-stream stalls we've been seeing on the 7am cron.
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-opus-5-5"
+# Opus 5.5 became the default 2026-09-26 after a blind-judged check (3 reps × 2
+# pools): best judged picks (1.67/1.45 vs Sonnet 4.6's 1.64/1.19 on a 0-3
+# scale; 50% vs 20% "worth reading" on the second pool), the most repeatable
+# (rep overlap 0.85/0.75), never mangled URLs, ~$0.16/run. If it rejects the
+# request itself (a 4xx, a refusal from its broader safety classifiers, a cut at
+# max_tokens), the known-good Sonnet 4.6 gets one try before the local model.
+BACKUP_MODEL = "claude-sonnet-4-6"
 
 # Request parameters differ by model, and a wrong one is a 400 — on 2026-09-25
 # Haiku 4.5 rejected `effort` and Opus 5.5 rejected disabled thinking. Before
@@ -85,7 +93,7 @@ TRIAGE_SCHEMA = {
                         "type": "string",
                         "enum": [
                             "ai", "tech", "world", "japan", "local",
-                            "science", "health", "philosophy", "cars",
+                            "science", "health", "philosophy", "cars", "ideas",
                         ],
                     },
                     "url": {"type": "string"},
@@ -415,6 +423,7 @@ def _triage_via_claude(
                     elif event.type in STRUCTURAL:
                         logger.info(f"stream t+{elapsed:.2f}s: {event.type}")
                 message = stream.get_final_message()
+                request_id = getattr(stream, "request_id", None)  # not set on the final message in anthropic 0.97
             total = time.monotonic() - stream_start
             logger.info(
                 f"stream complete: {event_count} events ({delta_count} deltas) "
@@ -423,7 +432,7 @@ def _triage_via_claude(
             meta.update(
                 usage=_usage_dict(message),
                 stop_reason=message.stop_reason,
-                request_id=getattr(message, "_request_id", None),
+                request_id=request_id or getattr(message, "_request_id", None),
             )
             attempts.append({"attempt": attempt, "seconds": round(total, 1), "error": None})
             logger.info(f"usage: {meta['usage']}; stop_reason={message.stop_reason}; request_id={meta['request_id']}")
@@ -611,6 +620,47 @@ def _triage_via_local(
     ) from last_err
 
 
+def _norm_url(u: str) -> str:
+    """host + path, without scheme, www., query, fragment or trailing slash."""
+    try:
+        parts = urlsplit(u.strip())
+    except ValueError:
+        return u.strip()
+    host = parts.netloc.lower()
+    host = host[4:] if host.startswith("www.") else host
+    return host + parts.path.rstrip("/")
+
+
+def _norm_title(t: str) -> str:
+    return re.sub(r"\s+", " ", t or "").strip().casefold()
+
+
+def resolve_picks(picks: list[TriagePick], articles: list[Article]) -> tuple[list[TriagePick], list[TriagePick]]:
+    """Tie each pick to the input article it names, and take URL, title and
+    source from that article. Models drop ?utm-style queries (so cross-day dedup
+    — an exact match on the feed's link — never saw them again) and sometimes
+    re-pick a story from the title-only "already covered" list with an invented
+    URL (7 of 12 in one local run, 2026-09-26). Matching: exact URL, then URL
+    without query/scheme/www (only where that is unambiguous), then exact title.
+    Returns (resolved, unmatched)."""
+    by_url = {a.link: a for a in articles}
+    norm_count: dict[str, int] = {}
+    for a in articles:
+        norm_count[_norm_url(a.link)] = norm_count.get(_norm_url(a.link), 0) + 1
+    by_norm = {_norm_url(a.link): a for a in articles if norm_count[_norm_url(a.link)] == 1}
+    by_title: dict[str, Article] = {}
+    for a in articles:
+        by_title.setdefault(_norm_title(a.title), a)
+    resolved, unmatched = [], []
+    for p in picks:
+        a = by_url.get(p.url) or by_norm.get(_norm_url(p.url)) or by_title.get(_norm_title(p.title))
+        if a is None:
+            unmatched.append(p)
+        else:
+            resolved.append(replace(p, url=a.link, title=a.title, source=a.source_name))
+    return resolved, unmatched
+
+
 def finalize_picks(picks: list[TriagePick]) -> tuple[list[TriagePick], list[TriagePick]]:
     """Best first, one entry per URL, at most MAX_PICKS. Returns (kept, dropped)."""
     seen: set[str] = set()
@@ -692,7 +742,7 @@ def triage(articles: list[Article]) -> TriageResult:
     local_model = os.getenv("TRIAGE_LOCAL_MODEL", DEFAULT_LOCAL_MODEL)
 
     meta: dict = {
-        "model": model,
+        "claude_model": model,
         "params": {k: v for k, v in request_params(model).items() if k != "output_config"}
         | {"effort": MODEL_PARAMS[model]["effort"], "max_tokens": MAX_TOKENS},
         "prompt_sha256": hashlib.sha256(system_prompt.encode()).hexdigest(),
@@ -708,9 +758,21 @@ def triage(articles: list[Article]) -> TriageResult:
     engine = f"claude:{model}"
     fallback_reason = ""
     try:
-        parsed, raw = _triage_via_claude(client, model, system_prompt, user_msg, meta)
+        try:
+            parsed, raw = _triage_via_claude(client, model, system_prompt, user_msg, meta)
+        except (ClaudeRequestError, ClaudeTruncatedError) as model_err:
+            # The request itself failed for this model — worth one try on the
+            # known-good backup before leaving Claude altogether.
+            if model == BACKUP_MODEL:
+                raise
+            fallback_reason = f"{model}: {type(model_err).__name__}: {model_err}"[:300]
+            logger.error(f"{fallback_reason} — retrying once on {BACKUP_MODEL}")
+            meta["backup_attempts"] = meta.pop("attempts", [])
+            parsed, raw = _triage_via_claude(client, BACKUP_MODEL, system_prompt, user_msg, meta)
+            engine = f"claude:{BACKUP_MODEL}"
     except Exception as claude_err:
-        fallback_reason = f"{type(claude_err).__name__}: {claude_err}"[:300]
+        reason = f"{type(claude_err).__name__}: {claude_err}"
+        fallback_reason = (f"{fallback_reason}; then {reason}" if fallback_reason else reason)[:400]
         if not fallback_enabled:
             raise
         logger.error(
@@ -740,7 +802,15 @@ def triage(articles: list[Article]) -> TriageResult:
         )
         for p in parsed.get("picks", [])
     ]
+    picks, unmatched = resolve_picks(picks, articles)
+    meta["unmatched_picks"] = len(unmatched)
+    if unmatched:
+        logger.warning(
+            f"Dropped {len(unmatched)} pick(s) that match no input article (invented or altered URLs): "
+            + "; ".join(f"{p.title[:60]} <{p.url[:80]}>" for p in unmatched)
+        )
     kept, dropped_picks = finalize_picks(picks)
+    dropped_picks = unmatched + dropped_picks
     if dropped_picks:
         logger.info(
             f"Picks: kept {len(kept)}, dropped {len(dropped_picks)} "
@@ -763,20 +833,20 @@ def triage(articles: list[Article]) -> TriageResult:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    
+
     from aggregator.fetch import fetch_all
-    
+
     articles = fetch_all()
     if not articles:
         print("No articles fetched. Exiting.")
         exit(1)
-    
+
     result = triage(articles)
-    
+
     print(f"\n=== Today's signal ===")
     print(result.summary)
     print(f"\n=== {len(result.picks)} picks from {result.article_count_in} articles ===\n")
-    
+
     for i, pick in enumerate(result.picks, start=1):
         print(f"{i}. [{pick.category}] {pick.source} (score: {pick.interest_score}/10)")
         print(f"   {pick.title}")

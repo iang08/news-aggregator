@@ -11,7 +11,9 @@ from __future__ import annotations
 import html
 import logging
 import re
+import statistics
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,9 +41,22 @@ FETCH_RETRY_BACKOFF_S = 60
 FEED_CONNECT_TIMEOUT_S = 10.0
 FEED_READ_TIMEOUT_S = 30.0   # max silence between bytes
 FEED_DEADLINE_S = 60.0       # whole download, however slowly it trickles in
-FEED_MAX_BYTES = 10_000_000
+FEED_MAX_BYTES = 25_000_000  # METR's feed is ~9 MB
+# Feeds download in parallel: with ~50 feeds, one-at-a-time worst case is
+# 50 x FEED_DEADLINE_S. Results keep sources.yaml order.
+FETCH_WORKERS = 8
 
 SUMMARY_MAX_CHARS = 1000
+# Substack/WordPress feeds often carry only a subtitle or "The post ... appeared
+# first on ..." in <description>; the article body is in <content>.
+SHORT_SUMMARY_CHARS = 80
+# An entry dated this far in the future is a pinned post or a bad date (one
+# blog pins a post dated year 9999) and would otherwise sit in every pool.
+FUTURE_SLACK = timedelta(hours=1)
+# A feed whose newest post is older than max(STALE_MIN, STALE_GAPS x its own
+# median gap between posts) has probably frozen, even though it answers 200.
+STALE_MIN = timedelta(days=21)
+STALE_GAPS = 3
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _SCRIPT_RE = re.compile(r"<(script|style)\b.*?</\1\s*>", re.I | re.S)
@@ -73,6 +88,9 @@ class SourceStatus:
     seconds: float = 0.0
     capped: int = 0                # in-window entries dropped by max_items
     window_truncated: bool = False  # feed's own item cap ends inside the window
+    future_skipped: int = 0        # entries dated in the future (pinned posts)
+    newest_age_h: float | None = None
+    stale: bool = False            # no new post for much longer than usual
 
 
 @dataclass
@@ -129,6 +147,7 @@ def load_sources(path: Path = Path("sources.yaml")) -> list[dict[str, Any]]:
         # Set defaults for optional fields
         src.setdefault("weight", 1.0)
         src.setdefault("max_items", 0)  # 0 = no per-run cap
+        src.setdefault("window_hours", 0)  # 0 = the run's window (24 h)
 
     return sources
 
@@ -173,12 +192,14 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article
         if http_status >= 400:
             raise FeedError(f"HTTP {http_status}")
         feed = feedparser.parse(body, response_headers={**headers, "content-location": final_url})
-        # No entries AND (a parse error, or no RSS/Atom version at all): an
-        # HTML page served with 200 — a soft 404, a bot check — parses cleanly
-        # as "a feed with nothing in it" and would otherwise look healthy.
-        if not feed.entries and (feed.bozo or not feed.get("version")):
+        # No entries at all: an HTML page served with 200 (a soft 404, a bot
+        # check) or an empty channel (a wrong note.com ID) — either way the feed
+        # is broken, even though nothing raised. A real feed always lists its
+        # latest posts, whatever the window.
+        if not feed.entries:
             ctype = headers.get("content-type", "?").split(";")[0]
-            raise FeedError(f"not a parseable feed (HTTP {http_status}, {ctype})")
+            what = "not a parseable feed" if (feed.bozo or not feed.get("version")) else "feed has no entries"
+            raise FeedError(f"{what} (HTTP {http_status}, {ctype})")
     except FeedError as e:
         status.error = str(e)
         status.seconds = round(time.monotonic() - t0, 1)
@@ -187,30 +208,59 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article
 
     articles: list[Article] = []
     oldest_dated: datetime | None = None
+    dated: list[datetime] = []
+    now = datetime.now(timezone.utc)
     for entry in feed.entries:
         # Get published time — feedparser exposes it as a struct_time
         published_parsed = entry.get("published_parsed") or entry.get("updated_parsed")
         if not published_parsed:
             continue  # Skip entries with no date — can't filter by recency
 
-        published = datetime(*published_parsed[:6], tzinfo=timezone.utc)
+        try:
+            published = datetime(*published_parsed[:6], tzinfo=timezone.utc)
+        except (ValueError, OverflowError):
+            continue  # an impossible date
+        if published > now + FUTURE_SLACK:
+            status.future_skipped += 1
+            continue
+        dated.append(published)
         if oldest_dated is None or published < oldest_dated:
             oldest_dated = published
         if published < cutoff:
             continue  # Too old
 
-        summary, summary_detail = entry.get("summary") or "", entry.get("summary_detail")
-        if not summary and entry.get("content"):
-            summary, summary_detail = entry["content"][0].get("value", ""), entry["content"][0]
+        summary = _entry_text(entry.get("summary"), entry.get("summary_detail"))
+        if (len(summary) < SHORT_SUMMARY_CHARS or "appeared first on" in summary) and entry.get("content"):
+            body = _entry_text(entry["content"][0].get("value", ""), entry["content"][0])
+            if len(body) > len(summary):
+                summary = body
         articles.append(Article(
             title=_entry_text(entry.get("title"), entry.get("title_detail")) or "(no title)",
             link=entry.get("link", ""),
-            summary=_entry_text(summary, summary_detail)[:SUMMARY_MAX_CHARS],
+            summary=summary[:SUMMARY_MAX_CHARS],
             published=published,
             source_name=name,
             source_category=source["category"],
             source_weight=source["weight"],
         ))
+
+    if dated:
+        newest = max(dated)
+        status.newest_age_h = round((now - newest).total_seconds() / 3600, 1)
+        ordered = sorted(dated)
+        gaps = [(b - a).total_seconds() for a, b in zip(ordered, ordered[1:]) if b > a]
+        # Needs a rhythm to compare against: a journal TOC listing one issue
+        # (every entry the same date) can't be judged stale. Journals and rare
+        # bloggers set stale_days in sources.yaml instead.
+        if source.get("stale_days"):
+            limit = timedelta(days=source["stale_days"])
+        elif len(gaps) >= 2:
+            limit = max(STALE_MIN, timedelta(seconds=statistics.median(gaps)) * STALE_GAPS)
+        else:
+            limit = None
+        if limit is not None and now - newest > limit:
+            status.stale = True
+            logger.warning(f"  ! {name}: newest post is {status.newest_age_h / 24:.0f} days old; feed frozen?")
 
     # A feed that only ever returns its newest N items can end INSIDE our
     # window (Al Jazeera: 25 items ≈ 7.5 h), silently dropping the rest.
@@ -240,24 +290,29 @@ def fetch_all_with_status(hours_back: int = 24) -> FetchResult:
     the signature of network-not-ready (e.g., laptop just woke from sleep
     when launchd fired the job). See MAX_FETCH_ATTEMPTS / FETCH_RETRY_BACKOFF_S.
     """
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
     sources = load_sources()
+
+    def one(source: dict[str, Any]) -> tuple[list[Article], SourceStatus]:
+        # A per-source window_hours overrides the run's: journals and arXiv
+        # stamp entries hours or days before they actually appear.
+        hours = source.get("window_hours") or hours_back
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        try:
+            return fetch_source(source, cutoff)
+        except Exception as e:  # noqa: BLE001 — one bad entry (a typo'd URL, an odd feed) must never stop the run
+            logger.warning(f"  ✗ {source.get('name')}: {type(e).__name__}: {e}")
+            return [], SourceStatus(
+                name=str(source.get("name")), category=str(source.get("category")), ok=False,
+                error=f"{type(e).__name__}: {e}"[:160],
+            )
 
     for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
         all_articles: list[Article] = []
         statuses: list[SourceStatus] = []
-        for source in sources:
-            try:
-                articles, status = fetch_source(source, cutoff)
-            except Exception as e:  # noqa: BLE001 — one bad entry (a typo'd URL, an odd feed) must never stop the run
-                logger.warning(f"  ✗ {source.get('name')}: {type(e).__name__}: {e}")
-                articles = []
-                status = SourceStatus(
-                    name=str(source.get("name")), category=str(source.get("category")), ok=False,
-                    error=f"{type(e).__name__}: {e}"[:160],
-                )
-            all_articles.extend(articles)
-            statuses.append(status)
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+            for articles, status in pool.map(one, sources):  # map keeps sources.yaml order
+                all_articles.extend(articles)
+                statuses.append(status)
 
         failed = [s.name for s in statuses if not s.ok]
         logger.info(

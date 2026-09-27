@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # Section order. Unknown categories fall to the end; world news last on
 # purpose (Ian wants less geopolitics).
-CATEGORY_ORDER = ["ai", "tech", "japan", "cars", "science", "health", "philosophy", "local", "world"]
+CATEGORY_ORDER = ["ai", "tech", "japan", "cars", "science", "health", "philosophy", "ideas", "local", "world"]
 
 
 def _inbox() -> Path:
@@ -66,6 +66,7 @@ def write_brief(
     status: str = "ok",
     notices: list[str] | None = None,
     sources_down: list[SourceStatus] | None = None,
+    sources_stale: list[SourceStatus] | None = None,
 ) -> Path:
     """Format the triage result as markdown and write to Obsidian vault.
 
@@ -82,7 +83,8 @@ def write_brief(
             f"{existing.name} already exists ({existing}); set BRIEF_OVERWRITE=1 to replace it"
         )
 
-    markdown = format_brief(result, today, status=status, notices=notices, sources_down=sources_down)
+    markdown = format_brief(result, today, status=status, notices=notices, sources_down=sources_down,
+                            sources_stale=sources_stale)
     output_path.write_text(markdown, encoding="utf-8")
     logger.info(f"Wrote brief to {output_path}")
 
@@ -133,6 +135,7 @@ def format_brief(
     status: str = "ok",
     notices: list[str] | None = None,
     sources_down: list[SourceStatus] | None = None,
+    sources_stale: list[SourceStatus] | None = None,
 ) -> str:
     """Format a TriageResult as markdown."""
     engine = getattr(result, "engine", "claude")
@@ -186,6 +189,10 @@ def format_brief(
     if sources_down:
         down = " · ".join(f"{s.name} ({s.error})" for s in sources_down)
         lines.append(f"Sources down today: {down}")
+        lines.append("")
+    if sources_stale:
+        stale = " · ".join(f"{s.name} ({(s.newest_age_h or 0) / 24:.0f} days)" for s in sources_stale)
+        lines.append(f"Feeds with no new post in far longer than usual: {stale}")
         lines.append("")
     lines.append(f"*Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} · {engine}*")
 

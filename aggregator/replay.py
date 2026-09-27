@@ -26,10 +26,12 @@ import re
 import sys
 from collections import Counter
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 from anthropic import Anthropic
 
+from aggregator.fetch import Article
 from aggregator.triage import (
     MODEL,
     MODEL_PARAMS,
@@ -39,6 +41,7 @@ from aggregator.triage import (
     estimate_tokens,
     finalize_picks,
     load_env,
+    resolve_picks,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,7 +67,21 @@ def jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b) if a | b else 1.0
 
 
-def run_arm(client, model: str, system_prompt: str, user_msg: str) -> dict:
+_URL_LINE = re.compile(r"^    URL: (.+)$", re.M)
+
+
+def sent_articles(run_dir: Path, user_msg: str) -> list[Article]:
+    """The articles production actually sent: pool.json filtered to the URLs
+    in user_msg (cross-day dedup had removed the rest)."""
+    sent = set(_URL_LINE.findall(user_msg))
+    try:
+        pool = json.loads((run_dir / "pool.json").read_text())
+    except (OSError, ValueError):
+        return []
+    return [Article(**{**a, "published": datetime.fromisoformat(a["published"])}) for a in pool if a["link"] in sent]
+
+
+def run_arm(client, model: str, system_prompt: str, user_msg: str, articles: list[Article]) -> dict:
     meta: dict = {}
     try:
         parsed, raw = _triage_via_claude(client, model, system_prompt, user_msg, meta)
@@ -75,9 +92,10 @@ def run_arm(client, model: str, system_prompt: str, user_msg: str) -> dict:
                    summary=p["summary"], interest_score=int(p["interest_score"]), tags=p.get("tags", []))
         for p in parsed.get("picks", [])
     ]
+    picks, unmatched = resolve_picks(picks, articles)  # same as production
     kept, dropped = finalize_picks(picks)
     return {"ok": True, "summary": parsed.get("summary", ""), "picks": [asdict(p) for p in kept],
-            "dropped": [asdict(p) for p in dropped], "meta": meta}
+            "dropped": [asdict(p) for p in dropped], "unmatched": [asdict(p) for p in unmatched], "meta": meta}
 
 
 def summarize(results: dict) -> str:
@@ -131,7 +149,8 @@ def main(argv: list[str] | None = None) -> int:
     for d in map(Path, args.runs):
         um = d / "user_msg.txt"
         if um.is_file() and um.stat().st_size:
-            runs.append((d.name, um.read_text()))
+            text = um.read_text()
+            runs.append((d.name, text, sent_articles(d, text)))
         else:
             logger.warning(f"skipping {d}: no user_msg.txt (failed or pre-2026-09-26 run)")
     if not runs:
@@ -143,13 +162,13 @@ def main(argv: list[str] | None = None) -> int:
     cost = sum(
         (estimate_tokens(ptext) + estimate_tokens(um)) * PRICES.get(m, (5, 25))[0] / 1e6
         + EST_OUTPUT_TOKENS * PRICES.get(m, (5, 25))[1] / 1e6
-        for _, ptext, m in arms for _, um in runs
+        for _, ptext, m in arms for _, um, _ in runs
     ) * args.reps
     print(f"{len(arms)} arms × {len(runs)} pools × {args.reps} reps = {calls} API calls, ~${cost:.2f}")
     for name, _, _ in arms:
         print(f"  arm {name}")
-    for rid, _ in runs:
-        print(f"  pool {rid}")
+    for rid, _, arts in runs:
+        print(f"  pool {rid} ({len(arts)} articles)")
     if not args.apply:
         print("dry run — add --apply to call the API")
         return 0
@@ -159,14 +178,14 @@ def main(argv: list[str] | None = None) -> int:
                        timeout=STREAM_INACTIVITY_TIMEOUT_S)
     out = Path(args.out)
     results: dict = {}
-    for (name, ptext, model), (rid, um) in itertools.product(arms, runs):
+    for (name, ptext, model), (rid, um, arts) in itertools.product(arms, runs):
         for rep in range(1, args.reps + 1):
             path = out / rid / f"{name.replace('/', '_')}_r{rep}.json"
             if path.exists():  # resumable: never pay twice for a finished call
                 res = json.loads(path.read_text())
             else:
                 logger.info(f"{name} on {rid} rep {rep}")
-                res = run_arm(client, model, ptext, um)
+                res = run_arm(client, model, ptext, um, arts)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(json.dumps(res, ensure_ascii=False, indent=1, default=str))
             results.setdefault(name, {}).setdefault(rid, []).append(res)

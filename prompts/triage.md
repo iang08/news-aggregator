@@ -39,7 +39,7 @@ Return ONLY valid JSON, no preamble or commentary. The structure:
     {
       "title": "Article title",
       "source": "Source name (from the input)",
-      "category": "Category from input: ai, tech, world, japan, local, science, health, philosophy, cars",
+      "category": "Category from input: ai, tech, world, japan, local, science, health, philosophy, cars, ideas",
       "url": "Article URL",
       "summary": "1-2 sentences. WHY this matters specifically. Skip generic descriptions.",
       "interest_score": 1-10,

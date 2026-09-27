@@ -19,7 +19,8 @@ From the articles below, pick the ones most worth Ian's attention this morning. 
 **Favor:**
 - Anything that changes what Ian would do this week in one of the projects above: a new local model or inference release, an agent/eval result he can use, an auction-market or import-rule change, a tariff or CARB move, a crisis signal with a venture in it, a training or nutrition finding with real evidence behind it.
 - Japan as a country, not a battlefield: society, economy and business, science, technology, culture, daily life — from a variety of outlets. A Japanese-language article is as welcome as an English one.
-- Now and then, an essay by a genuinely original Japanese thinker (a long post from a writer's own blog or note) — at most one a day, only when it's substantial.
+- Now and then, an essay by a genuinely original Japanese thinker — 山形浩生, 安宅和人, 稲葉振一郎, 千葉雅也, 蛭川立, やねうらお and the like, from their own blogs or note. At most one a day, and only a substantial original essay: skip diary entries, book promotion, course admin and paid teasers (続きをみる, 有料).
+- Research that Ian's projects can use: for fitness and health, only human RCTs or meta-analyses with a practical training, nutrition or sleep takeaway (skip rodent and cell studies, drug trials, test-reliability papers); for the autonomous researcher, papers and reports on research agents and how to evaluate them.
 - Cross-disciplinary work: philosophy meets science, art meets technology, humanities meets AI.
 - Portland/PNW items with practical consequences (civic and regulatory decisions, regional economy) — not crime or weather.
 - Health and biotech journalism from quality sources when it's substantive research or industry news.
@@ -29,11 +30,13 @@ From the articles below, pick the ones most worth Ian's attention this morning. 
 - Generic "AI is changing everything" pieces, benchmark hype without substance, press-release rewrites.
 - Partisan US politics without real-world consequence; celebrity, royals, sports; market commentary and crypto speculation; listicles and content marketing.
 - Stories Ian has certainly already seen everywhere (major breaking news is fine; viral noise is not).
+- Bare market ticks (unless the yen moves enough to matter for Javan and JCF — then say how), はてブ togetter threads, manga and anonymous-diary posts.
+- Podcast-only episodes, journal issue announcements and front/back matter, newspaper-ad posts, open threads. A paywalled or title-only item is fine when the headline alone is decision-useful.
 
 ## Selection rules
 
 - **One pick per story.** When several outlets cover the same event, choose the single best source and leave the others out.
-- The source weight shown with each article is a prior about the outlet, not a free pass: a high-weight source still has to be worth reading today.
+- The source weight shown with each article (0.5-2.0, 1.0 is typical) is a prior about the outlet, not a free pass: a high-weight source still has to be worth reading today.
 - Diversify across areas when quality is comparable, but never trade signal for coverage.
 
 ## Writing each pick
