@@ -285,6 +285,43 @@ class FetchTests(unittest.TestCase):
         _, st = self.fetch_with(exc=FeedError("timed out (ReadTimeout)"))
         self.assertEqual((st.ok, st.error), (False, "timed out (ReadTimeout)"))
 
+    def test_fallback_url_serves_a_failed_feed(self):
+        body = rss([("t", "https://a/1", self.now, "s")])
+        calls = []
+
+        def fake(url):
+            calls.append(url)
+            if url == "https://f/rss":
+                raise FeedError("timed out (ConnectTimeout)")
+            return 200, {}, url, body
+        src = {**self.src, "fallback_url": "https://g/rss"}
+        with mock.patch.object(fetch, "_download", fake):
+            arts, st = fetch.fetch_source(src, self.cutoff)
+        self.assertEqual(calls, ["https://f/rss", "https://g/rss"])
+        self.assertEqual((len(arts), st.ok, st.error, st.http_status), (1, True, "", 200))
+        self.assertEqual(st.fallback_used, "primary failed: timed out (ConnectTimeout)")
+
+    def test_fallback_url_failing_too_reports_both(self):
+        def fake(url):
+            if url == "https://f/rss":
+                return 502, {}, url, b""
+            raise FeedError("timed out (ReadTimeout)")
+        with mock.patch.object(fetch, "_download", fake):
+            arts, st = fetch.fetch_source({**self.src, "fallback_url": "https://g/rss"}, self.cutoff)
+        self.assertEqual((arts, st.ok, st.fallback_used), ([], False, ""))
+        self.assertEqual(st.error, "HTTP 502; fallback: timed out (ReadTimeout)")
+        self.assertIsNone(st.http_status)
+
+    def test_no_fallback_when_primary_works(self):
+        calls = []
+
+        def fake(url):
+            calls.append(url)
+            return 200, {}, url, rss([("t", "https://a/1", self.now, "s")])
+        with mock.patch.object(fetch, "_download", fake):
+            _, st = fetch.fetch_source({**self.src, "fallback_url": "https://g/rss"}, self.cutoff)
+        self.assertEqual((calls, st.fallback_used), (["https://f/rss"], ""))
+
     def test_window_truncation_flag(self):
         items = [(f"n{i}", f"https://a/{i}", self.now - timedelta(minutes=30 * i), "s") for i in range(12)]
         _, st = self.fetch_with(rss(items))
@@ -704,6 +741,10 @@ class OutputTests(EnvTestCase):
         self.assertLess(md.index("[high]"), md.index("[low]"))  # sorted by score
         self.assertLess(md.index("## AI"), md.index("## JAPAN"))
         self.assertIn("Sources down today: WW (HTTP 404)", md)
+        fb = [SourceStatus(name="HN", category="ai", ok=True, fallback_used="primary failed: HTTP 502")]
+        self.assertIn("Served by a fallback feed: HN (primary failed: HTTP 502)",
+                      output.format_brief(result(picks), "2026-09-27", sources_fallback=fb))
+        self.assertNotIn("fallback", md)
         # cross-day dedup and the Mac feedback harvester both still read the picks
         self.assertEqual(len(triage._PICK_LINK_RE.findall(md)), 3)
         mover = load_mover()

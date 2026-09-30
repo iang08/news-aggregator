@@ -586,6 +586,9 @@ sources:
   # ─── Aggregators: keep LAST — dedupe_links prefers a real summary, then weight, then the first listing ───
   - name: "Hacker News (200+ pts)"
     url: "https://hnrss.org/newest?points=200&count=100"
+    # hnrss.org timed out or 502'd at 07:00 on 4 runs running (2026-09-27..30).
+    # Fallback = HN's own front page (30 items, no points filter, headline only).
+    fallback_url: "https://news.ycombinator.com/rss"
     category: ai
     weight: 1.0
     last_reviewed: "2026-09-26"

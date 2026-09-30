@@ -232,7 +232,8 @@ def run() -> tuple[int, str, str]:
         dead = dead_sources(fetch.sources, runs)
         status, notices = assess(fetch, result, dead)
         brief_path = write_brief(result, status=status, notices=notices, sources_down=fetch.failed,
-                                 sources_stale=[s for s in fetch.sources if s.ok and s.stale])
+                                 sources_stale=[s for s in fetch.sources if s.ok and s.stale],
+                                 sources_fallback=[s for s in fetch.sources if s.ok and s.fallback_used])
         for n in notices:
             logger.warning(f"DEGRADED: {n}")
         logger.info(f"=== Run complete ({status}). Brief at: {brief_path} ===")

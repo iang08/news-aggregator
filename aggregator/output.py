@@ -67,6 +67,7 @@ def write_brief(
     notices: list[str] | None = None,
     sources_down: list[SourceStatus] | None = None,
     sources_stale: list[SourceStatus] | None = None,
+    sources_fallback: list[SourceStatus] | None = None,
 ) -> Path:
     """Format the triage result as markdown and write to Obsidian vault.
 
@@ -84,7 +85,7 @@ def write_brief(
         )
 
     markdown = format_brief(result, today, status=status, notices=notices, sources_down=sources_down,
-                            sources_stale=sources_stale)
+                            sources_stale=sources_stale, sources_fallback=sources_fallback)
     output_path.write_text(markdown, encoding="utf-8")
     logger.info(f"Wrote brief to {output_path}")
 
@@ -154,6 +155,7 @@ def format_brief(
     notices: list[str] | None = None,
     sources_down: list[SourceStatus] | None = None,
     sources_stale: list[SourceStatus] | None = None,
+    sources_fallback: list[SourceStatus] | None = None,
 ) -> str:
     """Format a TriageResult as markdown."""
     engine = getattr(result, "engine", "claude")
@@ -218,6 +220,10 @@ def format_brief(
     if sources_stale:
         stale = " · ".join(f"{s.name} ({(s.newest_age_h or 0) / 24:.0f} days)" for s in sources_stale)
         lines.append(f"Feeds with no new post in far longer than usual: {stale}")
+        lines.append("")
+    if sources_fallback:
+        fb = " · ".join(f"{s.name} ({s.fallback_used})" for s in sources_fallback)
+        lines.append(f"Served by a fallback feed: {fb}")
         lines.append("")
     lines.append(f"*Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} · {engine}*")
 

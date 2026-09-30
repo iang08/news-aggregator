@@ -135,6 +135,7 @@ class SourceStatus:
     paid_skipped: int = 0          # paywalled items left out (Substack paid, paywalled outlet, page check)
     newest_age_h: float | None = None
     stale: bool = False            # no new post for much longer than usual
+    fallback_used: str = ""        # set when fallback_url served the feed: why the primary failed
 
 
 @dataclass
@@ -237,6 +238,25 @@ def _download(url: str) -> tuple[int, dict[str, str], str, bytes]:
         raise FeedError(f"{type(e).__name__}: {e}"[:160]) from e
 
 
+def _get_feed(url: str, status: SourceStatus) -> Any:
+    """Download and parse one feed URL; raise FeedError unless it lists entries."""
+    status.http_status = None
+    http_status, headers, final_url, body = _download(url)
+    status.http_status = http_status
+    if http_status >= 400:
+        raise FeedError(f"HTTP {http_status}")
+    feed = feedparser.parse(body, response_headers={**headers, "content-location": final_url})
+    # No entries at all: an HTML page served with 200 (a soft 404, a bot
+    # check) or an empty channel (a wrong note.com ID) — either way the feed
+    # is broken, even though nothing raised. A real feed always lists its
+    # latest posts, whatever the window.
+    if not feed.entries:
+        ctype = headers.get("content-type", "?").split(";")[0]
+        what = "not a parseable feed" if (feed.bozo or not feed.get("version")) else "feed has no entries"
+        raise FeedError(f"{what} (HTTP {http_status}, {ctype})")
+    return feed
+
+
 def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article], SourceStatus]:
     """Fetch a single feed and return (articles published after cutoff, status)."""
     name = source["name"]
@@ -245,24 +265,25 @@ def fetch_source(source: dict[str, Any], cutoff: datetime) -> tuple[list[Article
     t0 = time.monotonic()
 
     try:
-        http_status, headers, final_url, body = _download(source["url"])
-        status.http_status = http_status
-        if http_status >= 400:
-            raise FeedError(f"HTTP {http_status}")
-        feed = feedparser.parse(body, response_headers={**headers, "content-location": final_url})
-        # No entries at all: an HTML page served with 200 (a soft 404, a bot
-        # check) or an empty channel (a wrong note.com ID) — either way the feed
-        # is broken, even though nothing raised. A real feed always lists its
-        # latest posts, whatever the window.
-        if not feed.entries:
-            ctype = headers.get("content-type", "?").split(";")[0]
-            what = "not a parseable feed" if (feed.bozo or not feed.get("version")) else "feed has no entries"
-            raise FeedError(f"{what} (HTTP {http_status}, {ctype})")
+        feed = _get_feed(source["url"], status)
     except FeedError as e:
         status.error = str(e)
-        status.seconds = round(time.monotonic() - t0, 1)
-        logger.warning(f"  ✗ {name}: {status.error}")
-        return [], status
+        if not source.get("fallback_url"):
+            status.seconds = round(time.monotonic() - t0, 1)
+            logger.warning(f"  ✗ {name}: {status.error}")
+            return [], status
+        # A flaky host (hnrss.org timed out or 502'd at 07:00 four runs running,
+        # 2026-09-27..30) gets one try at a second feed covering the same ground.
+        logger.warning(f"  ✗ {name}: {status.error}; trying fallback_url")
+        try:
+            feed = _get_feed(source["fallback_url"], status)
+        except FeedError as e2:
+            status.error = f"{status.error}; fallback: {e2}"
+            status.seconds = round(time.monotonic() - t0, 1)
+            logger.warning(f"  ✗ {name}: {status.error}")
+            return [], status
+        status.fallback_used = f"primary failed: {status.error}"
+        status.error = ""
 
     articles: list[Article] = []
     oldest_dated: datetime | None = None
