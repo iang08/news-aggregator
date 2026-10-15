@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -499,6 +500,56 @@ class LocalCtxTests(unittest.TestCase):
         self.assertEqual(triage.local_num_ctx("x", "y" * 3500) % 4096, 0)
         with self.assertRaises(RuntimeError):
             triage.local_num_ctx("", "日" * 70000)
+
+
+class LocalMemoryGuardTests(unittest.TestCase):
+    """_local_memory_guard: MemAvailable AND `boxq fits 40`, unless already loaded."""
+    HOST, MODEL = "http://localhost:11434", "qwen3.6:35b-a3b"
+
+    def guard(self, avail_gb=60, boxq=None, loaded=()):
+        meminfo = f"MemTotal: 127000000 kB\nMemAvailable: {int(avail_gb * 1024 * 1024)} kB\n"
+        ps = mock.Mock(**{"json.return_value": {"models": [{"name": m} for m in loaded]}})
+        if boxq is None:
+            boxq = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "yes: ...\n", ""))
+        with mock.patch.object(triage, "open", mock.mock_open(read_data=meminfo), create=True), \
+                mock.patch.object(triage.subprocess, "run", boxq), \
+                mock.patch.object(triage.httpx, "get", return_value=ps):
+            triage._local_memory_guard(self.HOST, self.MODEL)
+        return boxq
+
+    def boxq_no(self):
+        return mock.Mock(return_value=subprocess.CompletedProcess(
+            [], 1, "no: memory: needs 159.1 of 121.2 GB = used 106.1 + job 40.0 + floor 25\n", ""))
+
+    def test_fits_loads(self):
+        run = self.guard()
+        run.assert_called_once_with([triage.BOXQ_BIN, "fits", "40"], capture_output=True, text=True,
+                                    timeout=triage.BOXQ_TIMEOUT_S)
+
+    def test_boxq_no_refuses_with_its_reason(self):
+        with self.assertRaisesRegex(RuntimeError, r"boxq: not loading qwen3.6:35b-a3b \(no: memory: needs 159.1"):
+            self.guard(boxq=self.boxq_no())
+
+    def test_boxq_missing_or_silent_refuses(self):
+        for err in (FileNotFoundError(2, "No such file"), subprocess.TimeoutExpired("boxq", 15)):
+            with self.subTest(err=type(err).__name__), self.assertRaisesRegex(RuntimeError, "boxq gave no answer"):
+                self.guard(boxq=mock.Mock(side_effect=err))
+
+    def test_already_loaded_skips_both_checks(self):
+        self.guard(boxq=self.boxq_no(), loaded=[self.MODEL])
+        self.guard(avail_gb=10, loaded=[self.MODEL])
+
+    def test_tight_memory_refuses_before_asking_boxq(self):
+        run = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, "only 10 GB available"):
+            self.guard(avail_gb=10, boxq=run)
+        run.assert_not_called()
+
+    def test_remote_ollama_not_checked(self):
+        run = mock.Mock()
+        with mock.patch.object(triage.subprocess, "run", run):
+            triage._local_memory_guard("http://evo-x2:11434", self.MODEL)
+        run.assert_not_called()
 
 
 # ------------------------------------------------------------ triage: Claude path

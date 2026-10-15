@@ -15,6 +15,7 @@ import math
 import os
 import random
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -182,6 +183,12 @@ LOCAL_MAX_CTX = 65536
 # Don't load a second ~23 GB model onto the shared box when it's already tight
 # (GECK's own 35B runs there too). Checked only for a local Ollama.
 LOCAL_MIN_AVAIL_GB = 30
+# boxq is the box-wide job broker (~/projects/infra/boxq). MemAvailable can't see
+# its leases, GECK's restore reserve or the floor, so the load must also pass
+# `boxq fits`. A missing binary, a "no" or no answer in time all mean: don't load.
+BOXQ_BIN = "/home/ian/projects/infra/boxq/bin/boxq"
+BOXQ_FITS_GB = 40
+BOXQ_TIMEOUT_S = 15
 
 # Cross-day dedup. The brief is otherwise stateless — each run re-triages the
 # run's fetch window with no memory of what it featured before, so major multi-day
@@ -547,9 +554,23 @@ def local_num_ctx(system_prompt: str, user_msg: str) -> int:
     return max(16384, math.ceil(need / 4096) * 4096)
 
 
+def _boxq_refusal(local_model: str) -> str | None:
+    """None when `boxq fits` says the fallback model fits now; otherwise why not."""
+    try:
+        r = subprocess.run([BOXQ_BIN, "fits", str(BOXQ_FITS_GB)],
+                           capture_output=True, text=True, timeout=BOXQ_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"boxq gave no answer ({type(e).__name__}); not loading {local_model}"
+    if r.returncode == 0:
+        return None
+    answer = (r.stdout or r.stderr).strip().splitlines()
+    return f"boxq: not loading {local_model} ({answer[0] if answer else f'exit {r.returncode}'})"
+
+
 def _local_memory_guard(ollama_host: str, local_model: str) -> None:
     """Refuse to load the fallback model onto the shared box when memory is
-    tight, unless it is already loaded. Only applies to a local Ollama on Linux."""
+    tight or boxq says it doesn't fit, unless it is already loaded. Only
+    applies to a local Ollama on Linux."""
     if not any(h in ollama_host for h in ("localhost", "127.0.0.1")):
         return
     try:
@@ -558,7 +579,12 @@ def _local_memory_guard(ollama_host: str, local_model: str) -> None:
     except (OSError, StopIteration, ValueError):
         return
     avail_gb = avail_kb / 1024 / 1024
-    if avail_gb >= LOCAL_MIN_AVAIL_GB:
+    if avail_gb < LOCAL_MIN_AVAIL_GB:
+        refusal = (f"only {avail_gb:.0f} GB available on the box; not loading {local_model} "
+                   f"(needs >= {LOCAL_MIN_AVAIL_GB} GB free)")
+    else:
+        refusal = _boxq_refusal(local_model)
+    if refusal is None:
         return
     try:
         loaded = [m.get("name", "") for m in httpx.get(f"{ollama_host}/api/ps", timeout=10).json().get("models", [])]
@@ -566,10 +592,7 @@ def _local_memory_guard(ollama_host: str, local_model: str) -> None:
         loaded = []
     if local_model in loaded:
         return
-    raise RuntimeError(
-        f"only {avail_gb:.0f} GB available on the box; not loading {local_model} "
-        f"(needs >= {LOCAL_MIN_AVAIL_GB} GB free)"
-    )
+    raise RuntimeError(refusal)
 
 
 def _triage_via_local(
