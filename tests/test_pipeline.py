@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -502,54 +503,110 @@ class LocalCtxTests(unittest.TestCase):
             triage.local_num_ctx("", "日" * 70000)
 
 
-class LocalMemoryGuardTests(unittest.TestCase):
-    """_local_memory_guard: MemAvailable AND `boxq fits 40`, unless already loaded."""
+class BoxqLeaseTests(unittest.TestCase):
+    """_triage_via_local books EVO's memory with `boxq lease` (infra P2-02): only "granted"
+    loads, and the lease is released after. A real fake boxq script, so the subprocess path
+    (argv, cwd, timeout) is the one that runs at 07:00."""
     HOST, MODEL = "http://localhost:11434", "qwen3.6:35b-a3b"
+    FAKE = """#!/bin/sh
+echo "$(pwd) $*" >> "$0.calls"
+case "$1" in
+  lease) case "$(cat "$0.mode")" in
+    granted) echo "granted 31 until 10-19 07:15; boxq release 31 when done"; exit 0 ;;
+    refused) echo "refused 31: memory: needs 40.0 GB, room 17.8 GB"; exit 1 ;;
+    shadow)  echo "SHADOW: would grant lease 31: fits"; exit 0 ;;
+    noid)    echo "granted"; exit 0 ;;
+    hang)    exec sleep 30 ;;
+  esac ;;
+  release) echo "released 31"; exit 0 ;;
+esac
+exit 2
+"""
 
-    def guard(self, avail_gb=60, boxq=None, loaded=()):
-        meminfo = f"MemTotal: 127000000 kB\nMemAvailable: {int(avail_gb * 1024 * 1024)} kB\n"
-        ps = mock.Mock(**{"json.return_value": {"models": [{"name": m} for m in loaded]}})
-        if boxq is None:
-            boxq = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "yes: ...\n", ""))
-        with mock.patch.object(triage, "open", mock.mock_open(read_data=meminfo), create=True), \
-                mock.patch.object(triage.subprocess, "run", boxq), \
-                mock.patch.object(triage.httpx, "get", return_value=ps):
-            triage._local_memory_guard(self.HOST, self.MODEL)
-        return boxq
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.boxq = Path(self.tmp.name) / "boxq"
+        self.boxq.write_text(self.FAKE)
+        self.boxq.chmod(0o755)
+        patcher = mock.patch.object(triage, "BOXQ_BIN", str(self.boxq))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-    def boxq_no(self):
-        return mock.Mock(return_value=subprocess.CompletedProcess(
-            [], 1, "no: memory: needs 159.1 of 121.2 GB = used 106.1 + job 40.0 + floor 25\n", ""))
+    def calls(self):
+        f = Path(f"{self.boxq}.calls")
+        return f.read_text().splitlines() if f.exists() else []
 
-    def test_fits_loads(self):
-        run = self.guard()
-        run.assert_called_once_with([triage.BOXQ_BIN, "fits", "40"], capture_output=True, text=True,
-                                    timeout=triage.BOXQ_TIMEOUT_S)
+    def run_local(self, mode="granted", host=None, attempts=None):
+        Path(f"{self.boxq}.mode").write_text(mode)
+        attempts = attempts or mock.Mock(return_value=({"summary": "l", "picks": []}, "{}"))
+        with mock.patch.object(triage, "_local_attempts", attempts):
+            out = triage._triage_via_local("sys", "user", host or self.HOST, self.MODEL, {})
+        return out, attempts
 
-    def test_boxq_no_refuses_with_its_reason(self):
-        with self.assertRaisesRegex(RuntimeError, r"boxq: not loading qwen3.6:35b-a3b \(no: memory: needs 159.1"):
-            self.guard(boxq=self.boxq_no())
+    def test_granted_loads_then_releases(self):
+        out, attempts = self.run_local("granted")
+        self.assertEqual(out[1], "{}")
+        attempts.assert_called_once()
+        lease, release = self.calls()
+        self.assertTrue(lease.startswith(f"{triage.REPO_DIR} lease --mem 40 --for 15m --holder news_agg "
+                                         f"--pid {os.getpid()} --ollama-model {self.MODEL} --no-wait"), lease)
+        self.assertEqual(release, f"{triage.REPO_DIR} release 31")
 
-    def test_boxq_missing_or_silent_refuses(self):
-        for err in (FileNotFoundError(2, "No such file"), subprocess.TimeoutExpired("boxq", 15)):
-            with self.subTest(err=type(err).__name__), self.assertRaisesRegex(RuntimeError, "boxq gave no answer"):
-                self.guard(boxq=mock.Mock(side_effect=err))
+    def test_released_when_the_local_call_fails(self):
+        with self.assertRaisesRegex(RuntimeError, "ollama down"):
+            self.run_local("granted", attempts=mock.Mock(side_effect=RuntimeError("ollama down")))
+        self.assertEqual(self.calls()[-1].split()[1:], ["release", "31"])
 
-    def test_already_loaded_skips_both_checks(self):
-        self.guard(boxq=self.boxq_no(), loaded=[self.MODEL])
-        self.guard(avail_gb=10, loaded=[self.MODEL])
+    def test_anything_but_granted_loads_nothing(self):
+        cases = {"refused": r"boxq: not loading qwen3.6:35b-a3b \(refused 31: memory: needs 40.0 GB",
+                 "shadow": r"boxq: not loading qwen3.6:35b-a3b \(SHADOW: would grant",
+                 "noid": r"boxq: not loading qwen3.6:35b-a3b \(granted\)"}
+        for mode, msg in cases.items():
+            with self.subTest(mode=mode):
+                Path(f"{self.boxq}.calls").unlink(missing_ok=True)
+                attempts = mock.Mock()
+                with self.assertRaisesRegex(RuntimeError, msg):
+                    self.run_local(mode, attempts=attempts)
+                attempts.assert_not_called()
+                self.assertEqual([c.split()[1] for c in self.calls()], ["lease"])   # no release
 
-    def test_tight_memory_refuses_before_asking_boxq(self):
-        run = mock.Mock()
-        with self.assertRaisesRegex(RuntimeError, "only 10 GB available"):
-            self.guard(avail_gb=10, boxq=run)
-        run.assert_not_called()
+    def test_boxq_missing_loads_nothing(self):
+        attempts = mock.Mock()
+        with mock.patch.object(triage, "BOXQ_BIN", str(Path(self.tmp.name) / "nope")), \
+                self.assertRaisesRegex(RuntimeError, r"boxq gave no answer \(FileNotFoundError\)"):
+            self.run_local(attempts=attempts)
+        attempts.assert_not_called()
 
-    def test_remote_ollama_not_checked(self):
-        run = mock.Mock()
-        with mock.patch.object(triage.subprocess, "run", run):
-            triage._local_memory_guard("http://evo-x2:11434", self.MODEL)
-        run.assert_not_called()
+    def test_silent_boxq_defers_within_the_timeout(self):
+        attempts = mock.Mock()
+        t0 = time.monotonic()
+        with mock.patch.object(triage, "BOXQ_TIMEOUT_S", 1), \
+                self.assertRaisesRegex(RuntimeError, r"boxq gave no answer \(TimeoutExpired\)"):
+            self.run_local("hang", attempts=attempts)
+        self.assertLess(time.monotonic() - t0, 5)
+        attempts.assert_not_called()
+
+    def test_timeout_stays_above_the_cli_answer(self):
+        self.assertGreater(triage.BOXQ_TIMEOUT_S, 12)   # `boxq lease --no-wait` answers within 12 s
+
+    def test_every_evo_host_takes_a_lease(self):
+        for host in ("http://localhost:11434", "http://127.0.0.1:11434", "http://evo-x2:11434",
+                     "http://evo-x2.tail1234.ts.net:11434"):
+            with self.subTest(host=host):
+                Path(f"{self.boxq}.calls").unlink(missing_ok=True)
+                self.run_local("granted", host=host)
+                self.assertEqual([c.split()[1] for c in self.calls()], ["lease", "release"])
+
+    def test_off_box_ollama_takes_no_lease(self):
+        _, attempts = self.run_local("refused", host="http://10.0.0.5:11434")
+        attempts.assert_called_once()
+        self.assertEqual(self.calls(), [])
+
+    def test_oversized_prompt_fails_before_booking(self):
+        with self.assertRaises(RuntimeError):
+            triage._triage_via_local("", "日" * 70000, self.HOST, self.MODEL, {})
+        self.assertEqual(self.calls(), [])
 
 
 # ------------------------------------------------------------ triage: Claude path

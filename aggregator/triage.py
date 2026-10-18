@@ -180,15 +180,23 @@ LOCAL_RETRY_BACKOFF_S = 15
 # and an undersized num_ctx makes Ollama silently drop the start of the prompt.
 LOCAL_OUTPUT_ROOM = 6000
 LOCAL_MAX_CTX = 65536
-# Don't load a second ~23 GB model onto the shared box when it's already tight
-# (GECK's own 35B runs there too). Checked only for a local Ollama.
-LOCAL_MIN_AVAIL_GB = 30
-# boxq is the box-wide job broker (~/projects/infra/boxq). MemAvailable can't see
-# its leases, GECK's restore reserve or the floor, so the load must also pass
-# `boxq fits`. A missing binary, a "no" or no answer in time all mean: don't load.
+# boxq is EVO-X2's box-wide job broker (~/projects/infra/boxq). Before the fallback
+# loads its model onto EVO it takes a boxq LEASE: a booking that says "this process
+# will hold ~40 GB for up to 15 min", which boxq counts when it admits anyone else
+# (infra BUILD-PLAN P2-02). boxq is the only memory gate (infra ADR 18), so the
+# MemAvailable check that used to sit here is gone. Only "granted" loads: "refused",
+# "SHADOW:" (books nothing), a missing binary or no answer in time all mean don't
+# load. The lease also ends by itself when this process exits.
 BOXQ_BIN = "/home/ian/projects/infra/boxq/bin/boxq"
-BOXQ_FITS_GB = 40
-BOXQ_TIMEOUT_S = 15
+BOXQ_LEASE_GB = 40          # the 35B-A3B at up to LOCAL_MAX_CTX, plus headroom
+BOXQ_LEASE_FOR = "15m"      # ~4 min per attempt, LOCAL_ATTEMPTS of them; released right after
+BOXQ_TIMEOUT_S = 15         # must stay above the CLI's own 12 s answer for --no-wait
+# Ollama hosts that are EVO itself, where the lease applies. (The code default is
+# evo-x2; EVO's .env says localhost.)
+EVO_OLLAMA_HOSTS = ("localhost", "127.0.0.1", "::1", "evo-x2")
+# The lease is requested from the repo dir: boxq notes the requester's cwd, and a
+# cron job's default cwd (~) would make it claim things rooted at ~ (infra P2-01 open issue 1).
+REPO_DIR = Path(__file__).resolve().parent.parent
 
 # Cross-day dedup. The brief is otherwise stateless — each run re-triages the
 # run's fetch window with no memory of what it featured before, so major multi-day
@@ -554,45 +562,38 @@ def local_num_ctx(system_prompt: str, user_msg: str) -> int:
     return max(16384, math.ceil(need / 4096) * 4096)
 
 
-def _boxq_refusal(local_model: str) -> str | None:
-    """None when `boxq fits` says the fallback model fits now; otherwise why not."""
+def _is_evo_ollama(ollama_host: str) -> bool:
+    """True when the Ollama host is EVO itself (its memory is the one boxq books)."""
+    host = (urlsplit(ollama_host).hostname or "").lower()
+    return host in EVO_OLLAMA_HOSTS or host.startswith("evo-x2.")
+
+
+def _boxq_lease(local_model: str) -> str:
+    """Book the fallback's memory with boxq and return the lease id. Raises
+    RuntimeError (the fallback-failed path) for anything but a grant."""
+    cmd = [BOXQ_BIN, "lease", "--mem", str(BOXQ_LEASE_GB), "--for", BOXQ_LEASE_FOR,
+           "--holder", "news_agg", "--pid", str(os.getpid()), "--ollama-model", local_model, "--no-wait"]
     try:
-        r = subprocess.run([BOXQ_BIN, "fits", str(BOXQ_FITS_GB)],
-                           capture_output=True, text=True, timeout=BOXQ_TIMEOUT_S)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=BOXQ_TIMEOUT_S, cwd=REPO_DIR)
     except (OSError, subprocess.TimeoutExpired) as e:
-        return f"boxq gave no answer ({type(e).__name__}); not loading {local_model}"
-    if r.returncode == 0:
-        return None
-    answer = (r.stdout or r.stderr).strip().splitlines()
-    return f"boxq: not loading {local_model} ({answer[0] if answer else f'exit {r.returncode}'})"
+        raise RuntimeError(f"boxq gave no answer ({type(e).__name__}); not loading {local_model}") from e
+    lines = (r.stdout or r.stderr).strip().splitlines()
+    answer = lines[0] if lines else f"exit {r.returncode}"
+    words = answer.split()
+    if r.returncode == 0 and len(words) >= 2 and words[0] == "granted":
+        logger.info(f"boxq: {answer}")
+        return words[1]
+    raise RuntimeError(f"boxq: not loading {local_model} ({answer})")
 
 
-def _local_memory_guard(ollama_host: str, local_model: str) -> None:
-    """Refuse to load the fallback model onto the shared box when memory is
-    tight or boxq says it doesn't fit, unless it is already loaded. Only
-    applies to a local Ollama on Linux."""
-    if not any(h in ollama_host for h in ("localhost", "127.0.0.1")):
-        return
+def _boxq_release(lease_id: str) -> None:
+    """Hand the booking back. Never raises: the lease also ends when this process exits."""
     try:
-        with open("/proc/meminfo") as f:
-            avail_kb = next(int(line.split()[1]) for line in f if line.startswith("MemAvailable:"))
-    except (OSError, StopIteration, ValueError):
-        return
-    avail_gb = avail_kb / 1024 / 1024
-    if avail_gb < LOCAL_MIN_AVAIL_GB:
-        refusal = (f"only {avail_gb:.0f} GB available on the box; not loading {local_model} "
-                   f"(needs >= {LOCAL_MIN_AVAIL_GB} GB free)")
-    else:
-        refusal = _boxq_refusal(local_model)
-    if refusal is None:
-        return
-    try:
-        loaded = [m.get("name", "") for m in httpx.get(f"{ollama_host}/api/ps", timeout=10).json().get("models", [])]
-    except (httpx.HTTPError, ValueError):
-        loaded = []
-    if local_model in loaded:
-        return
-    raise RuntimeError(refusal)
+        r = subprocess.run([BOXQ_BIN, "release", lease_id], capture_output=True, text=True,
+                           timeout=BOXQ_TIMEOUT_S, cwd=REPO_DIR)
+        logger.info(f"boxq: {(r.stdout or r.stderr).strip() or f'release {lease_id}: exit {r.returncode}'}")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.warning(f"boxq release {lease_id} failed ({type(e).__name__}); it ends when this run exits")
 
 
 def _triage_via_local(
@@ -606,9 +607,21 @@ def _triage_via_local(
     num_ctx is sized from the real prompt — the article block is large, and
     an undersized context window silently truncates the input. keep_alive is
     pinned short because EVO-X2 is a shared box (don't hold 35B in RAM).
-    think=False: Qwen3.6 reasons by default, which only adds minutes here."""
+    think=False: Qwen3.6 reasons by default, which only adds minutes here.
+    On EVO the load is booked with a boxq lease first and released after."""
     num_ctx = local_num_ctx(system_prompt, user_msg)
-    _local_memory_guard(ollama_host, local_model)
+    lease_id = _boxq_lease(local_model) if _is_evo_ollama(ollama_host) else None
+    try:
+        return _local_attempts(system_prompt, user_msg, ollama_host, local_model, meta, num_ctx)
+    finally:
+        if lease_id:
+            _boxq_release(lease_id)
+
+
+def _local_attempts(
+    system_prompt: str, user_msg: str, ollama_host: str, local_model: str, meta: dict, num_ctx: int
+) -> tuple[dict, str]:
+    """LOCAL_ATTEMPTS tries of the Ollama call. Returns (parsed, raw) or raises."""
     logger.info(f"Local fallback: {local_model} @ {ollama_host} (num_ctx={num_ctx})")
     t0 = time.monotonic()
     last_err: Exception | None = None
